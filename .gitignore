@@ -1,1 +1,5 @@
 .claude/
+.DS_Store
+services/order-service/order-service
+services/inventory-service/inventory-service
+services/payment-service/payment-service

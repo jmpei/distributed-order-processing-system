@@ -1,0 +1,131 @@
+networks:
+  order-net:
+    driver: bridge
+
+volumes:
+  mysql-order-data:
+  mysql-inventory-data:
+  mysql-payment-data:
+  rabbitmq-data:
+
+services:
+  # ── MySQL ────────────────────────────────────────────────────
+  mysql-order:
+    image: mysql:8
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-rootpw}
+      MYSQL_DATABASE: orders_db
+    ports:
+      - "3307:3306"
+    volumes:
+      - mysql-order-data:/var/lib/mysql
+    networks:
+      - order-net
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-p${MYSQL_ROOT_PASSWORD:-rootpw}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  mysql-inventory:
+    image: mysql:8
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-rootpw}
+      MYSQL_DATABASE: inventory_db
+    ports:
+      - "3308:3306"
+    volumes:
+      - mysql-inventory-data:/var/lib/mysql
+    networks:
+      - order-net
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-p${MYSQL_ROOT_PASSWORD:-rootpw}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  mysql-payment:
+    image: mysql:8
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-rootpw}
+      MYSQL_DATABASE: payments_db
+    ports:
+      - "3309:3306"
+    volumes:
+      - mysql-payment-data:/var/lib/mysql
+    networks:
+      - order-net
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-p${MYSQL_ROOT_PASSWORD:-rootpw}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  # ── RabbitMQ ─────────────────────────────────────────────────
+  rabbitmq:
+    image: rabbitmq:3-management
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+    networks:
+      - order-net
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  # ── Services ─────────────────────────────────────────────────
+  order-service:
+    build:
+      context: ../services/order-service
+      dockerfile: Dockerfile
+    ports:
+      - "8081:8081"
+    environment:
+      ORDER_PORT: "8081"
+    networks:
+      - order-net
+    depends_on:
+      mysql-order:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+
+  inventory-service:
+    build:
+      context: ../services/inventory-service
+      dockerfile: Dockerfile
+    ports:
+      - "8082:8082"
+    environment:
+      INVENTORY_PORT: "8082"
+    networks:
+      - order-net
+    depends_on:
+      mysql-inventory:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+
+  payment-service:
+    build:
+      context: ../services/payment-service
+      dockerfile: Dockerfile
+    ports:
+      - "8083:8083"
+    environment:
+      PAYMENT_PORT: "8083"
+    networks:
+      - order-net
+    depends_on:
+      mysql-payment:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
