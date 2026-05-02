@@ -14,14 +14,17 @@ import (
 	"github.com/TomatoesSuck/distributed-order-processing/payment-service/internal/config"
 	"github.com/TomatoesSuck/distributed-order-processing/payment-service/internal/db"
 	"github.com/TomatoesSuck/distributed-order-processing/payment-service/internal/handler"
+	"github.com/TomatoesSuck/distributed-order-processing/payment-service/internal/messaging"
 	"github.com/TomatoesSuck/distributed-order-processing/payment-service/internal/model"
 	"github.com/TomatoesSuck/distributed-order-processing/payment-service/internal/repository"
 	"github.com/TomatoesSuck/distributed-order-processing/payment-service/internal/service"
+	shared "github.com/TomatoesSuck/distributed-order-processing/shared"
 )
 
 func main() {
 	cfg := config.Load()
 
+	// ── Database ─────────────────────────────────────────────────
 	database, err := db.Connect(cfg)
 	if err != nil {
 		log.Fatalf("service=payment db connect: %v", err)
@@ -32,14 +35,40 @@ func main() {
 	}
 	defer sqlDB.Close()
 
-	if err := database.AutoMigrate(&model.Payment{}); err != nil {
+	if err := database.AutoMigrate(&model.Payment{}, &model.ProcessedEvent{}); err != nil {
 		log.Fatalf("service=payment automigrate: %v", err)
 	}
 
-	repo := repository.NewPaymentRepository(database)
-	svc := service.NewPaymentService(repo)
-	h := handler.NewPaymentHandler(svc)
+	// ── RabbitMQ ─────────────────────────────────────────────────
+	mq, err := messaging.New(cfg.RabbitMQURL)
+	if err != nil {
+		log.Fatalf("service=payment amqp connect: %v", err)
+	}
+	defer mq.Close()
 
+	if err := messaging.Setup(mq); err != nil {
+		log.Fatalf("service=payment amqp topology: %v", err)
+	}
+
+	// ── Wiring ───────────────────────────────────────────────────
+	pub := messaging.NewPublisher(mq)
+	paymentRepo := repository.NewPaymentRepository(database)
+	eventRepo := repository.NewProcessedEventRepository(database)
+	cmdHandler := service.NewPaymentCommandHandler(database, paymentRepo, eventRepo, pub)
+
+	paymentSvc := service.NewPaymentService(paymentRepo)
+	h := handler.NewPaymentHandler(paymentSvc)
+
+	// ── Consumer ─────────────────────────────────────────────────
+	consumerCtx, stopConsumers := context.WithCancel(context.Background())
+	defer stopConsumers()
+
+	if err := messaging.StartConsumer(consumerCtx, mq, shared.QueuePaymentCommands, cmdHandler.Handle); err != nil {
+		log.Fatalf("service=payment start consumer: %v", err)
+	}
+	log.Printf("service=payment consumer started on %s", shared.QueuePaymentCommands)
+
+	// ── HTTP ─────────────────────────────────────────────────────
 	r := gin.New()
 	r.Use(gin.Recovery())
 	r.GET("/health", func(c *gin.Context) {
@@ -47,11 +76,7 @@ func main() {
 	})
 	h.Register(r)
 
-	srv := &http.Server{
-		Addr:    ":" + cfg.Port,
-		Handler: r,
-	}
-
+	srv := &http.Server{Addr: ":" + cfg.Port, Handler: r}
 	go func() {
 		log.Printf("service=payment port=%s starting", cfg.Port)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
@@ -59,9 +84,12 @@ func main() {
 		}
 	}()
 
+	// ── Graceful shutdown ─────────────────────────────────────────
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGTERM, syscall.SIGINT)
 	<-quit
+
+	stopConsumers()
 
 	shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()

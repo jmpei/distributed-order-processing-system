@@ -13,11 +13,12 @@ import (
 )
 
 type OrderHandler struct {
-	svc *service.OrderService
+	svc          *service.OrderService
+	orchestrator *service.SagaOrchestrator
 }
 
-func NewOrderHandler(svc *service.OrderService) *OrderHandler {
-	return &OrderHandler{svc: svc}
+func NewOrderHandler(svc *service.OrderService, orchestrator *service.SagaOrchestrator) *OrderHandler {
+	return &OrderHandler{svc: svc, orchestrator: orchestrator}
 }
 
 func (h *OrderHandler) Register(r *gin.Engine) {
@@ -49,6 +50,12 @@ func (h *OrderHandler) Create(c *gin.Context) {
 
 	if err := h.svc.CreateOrder(c.Request.Context(), order); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error(), "code": "CREATE_FAILED"})
+		return
+	}
+
+	if err := h.orchestrator.StartSaga(c.Request.Context(), order); err != nil {
+		// Order is persisted; saga start failure is logged and surfaced but order_id is still returned.
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error(), "code": "SAGA_START_FAILED"})
 		return
 	}
 

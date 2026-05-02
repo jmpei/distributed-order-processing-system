@@ -1,8 +1,13 @@
 FROM golang:1.25-alpine AS builder
 WORKDIR /app
-COPY go.mod go.sum ./
-RUN go mod download
-COPY . .
+
+COPY shared/ ./shared/
+
+COPY services/payment-service/go.mod services/payment-service/go.sum ./services/payment-service/
+RUN cd services/payment-service && go mod download
+
+COPY services/payment-service/ ./services/payment-service/
+WORKDIR /app/services/payment-service
 RUN CGO_ENABLED=0 GOOS=linux go build -o /payment-service ./cmd
 
 FROM alpine:3.19

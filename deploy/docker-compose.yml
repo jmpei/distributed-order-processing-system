@@ -82,10 +82,11 @@ services:
       start_period: 30s
 
   # ── Services ─────────────────────────────────────────────────
+  # Build context is the project root (../) so Dockerfiles can COPY shared/
   order-service:
     build:
-      context: ../services/order-service
-      dockerfile: Dockerfile
+      context: ../
+      dockerfile: services/order-service/Dockerfile
     ports:
       - "8081:8081"
     environment:
@@ -95,6 +96,7 @@ services:
       DB_USER: root
       DB_PASS: ${MYSQL_ROOT_PASSWORD:-rootpw}
       DB_NAME: orders_db
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
     networks:
       - order-net
     depends_on:
@@ -105,8 +107,8 @@ services:
 
   inventory-service:
     build:
-      context: ../services/inventory-service
-      dockerfile: Dockerfile
+      context: ../
+      dockerfile: services/inventory-service/Dockerfile
     ports:
       - "8082:8082"
     environment:
@@ -116,6 +118,7 @@ services:
       DB_USER: root
       DB_PASS: ${MYSQL_ROOT_PASSWORD:-rootpw}
       DB_NAME: inventory_db
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
     networks:
       - order-net
     depends_on:
@@ -126,8 +129,8 @@ services:
 
   payment-service:
     build:
-      context: ../services/payment-service
-      dockerfile: Dockerfile
+      context: ../
+      dockerfile: services/payment-service/Dockerfile
     ports:
       - "8083:8083"
     environment:
@@ -137,6 +140,7 @@ services:
       DB_USER: root
       DB_PASS: ${MYSQL_ROOT_PASSWORD:-rootpw}
       DB_NAME: payments_db
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
     networks:
       - order-net
     depends_on:

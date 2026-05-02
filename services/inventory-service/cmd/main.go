@@ -14,14 +14,17 @@ import (
 	"github.com/TomatoesSuck/distributed-order-processing/inventory-service/internal/config"
 	"github.com/TomatoesSuck/distributed-order-processing/inventory-service/internal/db"
 	"github.com/TomatoesSuck/distributed-order-processing/inventory-service/internal/handler"
+	"github.com/TomatoesSuck/distributed-order-processing/inventory-service/internal/messaging"
 	"github.com/TomatoesSuck/distributed-order-processing/inventory-service/internal/model"
 	"github.com/TomatoesSuck/distributed-order-processing/inventory-service/internal/repository"
 	"github.com/TomatoesSuck/distributed-order-processing/inventory-service/internal/service"
+	shared "github.com/TomatoesSuck/distributed-order-processing/shared"
 )
 
 func main() {
 	cfg := config.Load()
 
+	// ── Database ─────────────────────────────────────────────────
 	database, err := db.Connect(cfg)
 	if err != nil {
 		log.Fatalf("service=inventory db connect: %v", err)
@@ -32,13 +35,12 @@ func main() {
 	}
 	defer sqlDB.Close()
 
-	if err := database.AutoMigrate(&model.Inventory{}); err != nil {
+	if err := database.AutoMigrate(&model.Inventory{}, &model.InventoryLog{}); err != nil {
 		log.Fatalf("service=inventory automigrate: %v", err)
 	}
 
-	repo := repository.NewInventoryRepository(database)
-
-	ctx := context.Background()
+	// ── Seed ─────────────────────────────────────────────────────
+	invRepo := repository.NewInventoryRepository(database)
 	seeds := []struct {
 		productID    uint64
 		availableQty int
@@ -47,15 +49,41 @@ func main() {
 		{1002, 50},
 	}
 	for _, s := range seeds {
-		if err := repo.SeedIfNotExists(ctx, s.productID, s.availableQty); err != nil {
+		if err := invRepo.SeedIfNotExists(context.Background(), s.productID, s.availableQty); err != nil {
 			log.Fatalf("service=inventory seed product %d: %v", s.productID, err)
 		}
 	}
 	log.Println("service=inventory seed complete")
 
-	svc := service.NewInventoryService(repo)
-	h := handler.NewInventoryHandler(svc)
+	// ── RabbitMQ ─────────────────────────────────────────────────
+	mq, err := messaging.New(cfg.RabbitMQURL)
+	if err != nil {
+		log.Fatalf("service=inventory amqp connect: %v", err)
+	}
+	defer mq.Close()
 
+	if err := messaging.Setup(mq); err != nil {
+		log.Fatalf("service=inventory amqp topology: %v", err)
+	}
+
+	// ── Wiring ───────────────────────────────────────────────────
+	pub := messaging.NewPublisher(mq)
+	logRepo := repository.NewInventoryLogRepository(database)
+	cmdHandler := service.NewInventoryCommandHandler(database, invRepo, logRepo, pub)
+
+	invSvc := service.NewInventoryService(invRepo)
+	h := handler.NewInventoryHandler(invSvc)
+
+	// ── Consumer ─────────────────────────────────────────────────
+	consumerCtx, stopConsumers := context.WithCancel(context.Background())
+	defer stopConsumers()
+
+	if err := messaging.StartConsumer(consumerCtx, mq, shared.QueueInventoryCommands, cmdHandler.Handle); err != nil {
+		log.Fatalf("service=inventory start consumer: %v", err)
+	}
+	log.Printf("service=inventory consumer started on %s", shared.QueueInventoryCommands)
+
+	// ── HTTP ─────────────────────────────────────────────────────
 	r := gin.New()
 	r.Use(gin.Recovery())
 	r.GET("/health", func(c *gin.Context) {
@@ -63,11 +91,7 @@ func main() {
 	})
 	h.Register(r)
 
-	srv := &http.Server{
-		Addr:    ":" + cfg.Port,
-		Handler: r,
-	}
-
+	srv := &http.Server{Addr: ":" + cfg.Port, Handler: r}
 	go func() {
 		log.Printf("service=inventory port=%s starting", cfg.Port)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
@@ -75,9 +99,12 @@ func main() {
 		}
 	}()
 
+	// ── Graceful shutdown ─────────────────────────────────────────
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGTERM, syscall.SIGINT)
 	<-quit
+
+	stopConsumers()
 
 	shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()

@@ -14,14 +14,17 @@ import (
 	"github.com/TomatoesSuck/distributed-order-processing/order-service/internal/config"
 	"github.com/TomatoesSuck/distributed-order-processing/order-service/internal/db"
 	"github.com/TomatoesSuck/distributed-order-processing/order-service/internal/handler"
+	"github.com/TomatoesSuck/distributed-order-processing/order-service/internal/messaging"
 	"github.com/TomatoesSuck/distributed-order-processing/order-service/internal/model"
 	"github.com/TomatoesSuck/distributed-order-processing/order-service/internal/repository"
 	"github.com/TomatoesSuck/distributed-order-processing/order-service/internal/service"
+	shared "github.com/TomatoesSuck/distributed-order-processing/shared"
 )
 
 func main() {
 	cfg := config.Load()
 
+	// ── Database ─────────────────────────────────────────────────
 	database, err := db.Connect(cfg)
 	if err != nil {
 		log.Fatalf("service=order db connect: %v", err)
@@ -32,14 +35,41 @@ func main() {
 	}
 	defer sqlDB.Close()
 
-	if err := database.AutoMigrate(&model.Order{}); err != nil {
+	if err := database.AutoMigrate(&model.Order{}, &model.SagaState{}, &model.ProcessedEvent{}); err != nil {
 		log.Fatalf("service=order automigrate: %v", err)
 	}
 
-	repo := repository.NewOrderRepository(database)
-	svc := service.NewOrderService(repo)
-	h := handler.NewOrderHandler(svc)
+	// ── RabbitMQ ─────────────────────────────────────────────────
+	mq, err := messaging.New(cfg.RabbitMQURL)
+	if err != nil {
+		log.Fatalf("service=order amqp connect: %v", err)
+	}
+	defer mq.Close()
 
+	if err := messaging.Setup(mq); err != nil {
+		log.Fatalf("service=order amqp topology: %v", err)
+	}
+
+	// ── Wiring ───────────────────────────────────────────────────
+	pub := messaging.NewPublisher(mq)
+
+	orderRepo := repository.NewOrderRepository(database)
+	sagaRepo := repository.NewSagaRepository(database)
+	orderSvc := service.NewOrderService(orderRepo)
+	orchestrator := service.NewSagaOrchestrator(database, sagaRepo, orderRepo, pub)
+
+	h := handler.NewOrderHandler(orderSvc, orchestrator)
+
+	// ── Consumer ─────────────────────────────────────────────────
+	consumerCtx, stopConsumers := context.WithCancel(context.Background())
+	defer stopConsumers()
+
+	if err := messaging.StartConsumer(consumerCtx, mq, shared.QueueOrderEvents, orchestrator.HandleEvent); err != nil {
+		log.Fatalf("service=order start consumer: %v", err)
+	}
+	log.Printf("service=order consumer started on %s", shared.QueueOrderEvents)
+
+	// ── HTTP ─────────────────────────────────────────────────────
 	r := gin.New()
 	r.Use(gin.Recovery())
 	r.GET("/health", func(c *gin.Context) {
@@ -47,11 +77,7 @@ func main() {
 	})
 	h.Register(r)
 
-	srv := &http.Server{
-		Addr:    ":" + cfg.Port,
-		Handler: r,
-	}
-
+	srv := &http.Server{Addr: ":" + cfg.Port, Handler: r}
 	go func() {
 		log.Printf("service=order port=%s starting", cfg.Port)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
@@ -59,13 +85,16 @@ func main() {
 		}
 	}()
 
+	// ── Graceful shutdown ─────────────────────────────────────────
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGTERM, syscall.SIGINT)
 	<-quit
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	stopConsumers()
+
+	shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if err := srv.Shutdown(ctx); err != nil {
+	if err := srv.Shutdown(shutCtx); err != nil {
 		log.Fatalf("service=order forced shutdown: %v", err)
 	}
 	log.Println("service=order exited")
