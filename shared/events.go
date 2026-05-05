@@ -20,6 +20,7 @@ const (
 	RoutingKeyPaymentProcess    = "payment.process"
 	RoutingKeyPaymentRefund     = "payment.refund"
 	RoutingKeyInventoryReserved = "inventory.reserved"
+	RoutingKeyInventoryReleased = "inventory.released"
 	RoutingKeyPaymentProcessed  = "payment.processed"
 )
 
@@ -55,4 +56,22 @@ type PaymentProcessedEvent struct {
 	TransactionID string `json:"transaction_id"`
 	Success       bool   `json:"success"`
 	Reason        string `json:"reason,omitempty"`
+}
+
+// ReleaseInventoryCmd is published to saga.commands with routing key inventory.release
+type ReleaseInventoryCmd struct {
+	SagaID    string `json:"saga_id"`
+	OrderID   uint64 `json:"order_id"`
+	ProductID uint64 `json:"product_id"`
+	Quantity  int    `json:"quantity"`
+}
+
+// InventoryReleasedEvent is published to saga.events with routing key inventory.released
+type InventoryReleasedEvent struct {
+	SagaID    string `json:"saga_id"`
+	OrderID   uint64 `json:"order_id"`
+	ProductID uint64 `json:"product_id"`
+	Quantity  int    `json:"quantity"`
+	Success   bool   `json:"success"`
+	Reason    string `json:"reason,omitempty"`
 }
