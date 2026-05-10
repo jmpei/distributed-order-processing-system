@@ -69,6 +69,9 @@ func main() {
 	}
 	log.Printf("service=order consumer started on %s", shared.QueueOrderEvents)
 
+	go orchestrator.RecoverInProgressSagas(consumerCtx)
+	log.Printf("service=order saga recovery loop started")
+
 	// ── HTTP ─────────────────────────────────────────────────────
 	r := gin.New()
 	r.Use(gin.Recovery())

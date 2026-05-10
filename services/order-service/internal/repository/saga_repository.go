@@ -39,3 +39,19 @@ func (r *SagaRepository) GetByOrderID(ctx context.Context, orderID uint64) (*mod
 	}
 	return &s, nil
 }
+
+func (r *SagaRepository) ListByStatus(ctx context.Context, status string) ([]model.SagaState, error) {
+	var states []model.SagaState
+	if err := r.db.WithContext(ctx).Where("status = ?", status).Find(&states).Error; err != nil {
+		return nil, fmt.Errorf("list saga_state status=%s: %w", status, err)
+	}
+	return states, nil
+}
+
+func (r *SagaRepository) List(ctx context.Context) ([]model.SagaState, error) {
+	var states []model.SagaState
+	if err := r.db.WithContext(ctx).Order("created_at DESC").Find(&states).Error; err != nil {
+		return nil, fmt.Errorf("list saga_state: %w", err)
+	}
+	return states, nil
+}
