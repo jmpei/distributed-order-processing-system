@@ -69,7 +69,7 @@ func main() {
 	// ── Wiring ───────────────────────────────────────────────────
 	pub := messaging.NewPublisher(mq)
 	logRepo := repository.NewInventoryLogRepository(database)
-	cmdHandler := service.NewInventoryCommandHandler(database, invRepo, logRepo, pub)
+	cmdHandler := service.NewInventoryCommandHandler(database, invRepo, logRepo, pub, cfg.ReserveMaxRetries)
 
 	invSvc := service.NewInventoryService(invRepo)
 	h := handler.NewInventoryHandler(invSvc)

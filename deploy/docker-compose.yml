@@ -119,6 +119,7 @@ services:
       DB_PASS: ${MYSQL_ROOT_PASSWORD:-rootpw}
       DB_NAME: inventory_db
       RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+      INVENTORY_RESERVE_MAX_RETRIES: "${INVENTORY_RESERVE_MAX_RETRIES:-50}"
     networks:
       - order-net
     depends_on:
