@@ -9,6 +9,15 @@ import (
 	"github.com/TomatoesSuck/distributed-order-processing/inventory-service/internal/model"
 )
 
+// InventoryRepoIface is the surface InventoryCommandHandler and InventoryService depend on.
+type InventoryRepoIface interface {
+	Create(ctx context.Context, inv *model.Inventory) error
+	GetByProductID(ctx context.Context, productID uint64) (*model.Inventory, error)
+	UpdateAvailableQty(ctx context.Context, productID uint64, qty int) error
+	ReserveAtomic(ctx context.Context, productID, orderID uint64, expectedVersion, qty int) (int64, error)
+	ReleaseAtomic(ctx context.Context, productID, orderID uint64, qty int) (int64, error)
+}
+
 type InventoryRepository struct {
 	db *gorm.DB
 }
@@ -44,6 +53,70 @@ func (r *InventoryRepository) UpdateAvailableQty(ctx context.Context, productID 
 		return fmt.Errorf("inventory for product %d not found", productID)
 	}
 	return nil
+}
+
+// ReserveAtomic performs the optimistic-lock UPDATE and inventory_log insert in one transaction.
+// Returns RowsAffected of the UPDATE: 0 means version conflict, >0 means reserved.
+func (r *InventoryRepository) ReserveAtomic(ctx context.Context, productID, orderID uint64, expectedVersion, qty int) (int64, error) {
+	var rowsAffected int64
+	err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		result := tx.Model(&model.Inventory{}).
+			Where("product_id = ? AND version = ? AND available_qty >= ?",
+				productID, expectedVersion, qty).
+			Updates(map[string]any{
+				"available_qty": gorm.Expr("available_qty - ?", qty),
+				"reserved_qty":  gorm.Expr("reserved_qty + ?", qty),
+				"version":       gorm.Expr("version + 1"),
+			})
+		if result.Error != nil {
+			return fmt.Errorf("update inventory: %w", result.Error)
+		}
+		rowsAffected = result.RowsAffected
+		if rowsAffected == 0 {
+			return nil
+		}
+		return tx.Create(&model.InventoryLog{
+			ProductID: productID,
+			OrderID:   orderID,
+			Action:    model.InventoryActionReserve,
+			Quantity:  qty,
+		}).Error
+	})
+	if err != nil {
+		return 0, err
+	}
+	return rowsAffected, nil
+}
+
+// ReleaseAtomic refunds available_qty and writes a RELEASE log in one transaction.
+func (r *InventoryRepository) ReleaseAtomic(ctx context.Context, productID, orderID uint64, qty int) (int64, error) {
+	var rowsAffected int64
+	err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		result := tx.Model(&model.Inventory{}).
+			Where("product_id = ?", productID).
+			Updates(map[string]any{
+				"available_qty": gorm.Expr("available_qty + ?", qty),
+				"reserved_qty":  gorm.Expr("GREATEST(reserved_qty - ?, 0)", qty),
+				"version":       gorm.Expr("version + 1"),
+			})
+		if result.Error != nil {
+			return fmt.Errorf("update inventory: %w", result.Error)
+		}
+		rowsAffected = result.RowsAffected
+		if rowsAffected == 0 {
+			return nil
+		}
+		return tx.Create(&model.InventoryLog{
+			ProductID: productID,
+			OrderID:   orderID,
+			Action:    model.InventoryActionRelease,
+			Quantity:  qty,
+		}).Error
+	})
+	if err != nil {
+		return 0, err
+	}
+	return rowsAffected, nil
 }
 
 // SeedIfNotExists creates the record only when product_id is absent (idempotent).

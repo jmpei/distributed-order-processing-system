@@ -9,6 +9,13 @@ import (
 	"github.com/TomatoesSuck/distributed-order-processing/order-service/internal/model"
 )
 
+// OrderRepoIface is the surface SagaOrchestrator depends on; allows mocking.
+type OrderRepoIface interface {
+	Create(ctx context.Context, order *model.Order) error
+	GetByID(ctx context.Context, id uint64) (*model.Order, error)
+	ListByUserID(ctx context.Context, userID uint64) ([]model.Order, error)
+}
+
 type OrderRepository struct {
 	db *gorm.DB
 }

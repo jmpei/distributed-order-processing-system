@@ -11,6 +11,11 @@ import (
 	"github.com/TomatoesSuck/distributed-order-processing/payment-service/internal/model"
 )
 
+// ProcessedEventRepoIface is the surface PaymentCommandHandler depends on; allows mocking.
+type ProcessedEventRepoIface interface {
+	IsProcessed(ctx context.Context, eventID string) (bool, error)
+}
+
 type ProcessedEventRepository struct {
 	db *gorm.DB
 }

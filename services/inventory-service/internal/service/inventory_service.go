@@ -9,10 +9,10 @@ import (
 )
 
 type InventoryService struct {
-	repo *repository.InventoryRepository
+	repo repository.InventoryRepoIface
 }
 
-func NewInventoryService(repo *repository.InventoryRepository) *InventoryService {
+func NewInventoryService(repo repository.InventoryRepoIface) *InventoryService {
 	return &InventoryService{repo: repo}
 }
 

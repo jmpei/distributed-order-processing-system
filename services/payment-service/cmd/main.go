@@ -54,7 +54,7 @@ func main() {
 	pub := messaging.NewPublisher(mq)
 	paymentRepo := repository.NewPaymentRepository(database)
 	eventRepo := repository.NewProcessedEventRepository(database)
-	cmdHandler := service.NewPaymentCommandHandler(database, paymentRepo, eventRepo, pub, cfg.PaymentFailureRate)
+	cmdHandler := service.NewPaymentCommandHandler(paymentRepo, eventRepo, pub, cfg.PaymentFailureRate)
 
 	paymentSvc := service.NewPaymentService(paymentRepo)
 	h := handler.NewPaymentHandler(paymentSvc)

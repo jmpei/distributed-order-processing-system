@@ -4,37 +4,31 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"log"
 
 	amqp "github.com/rabbitmq/amqp091-go"
-	"gorm.io/gorm"
 
 	shared "github.com/TomatoesSuck/distributed-order-processing/shared"
 
 	"github.com/TomatoesSuck/distributed-order-processing/inventory-service/internal/messaging"
-	"github.com/TomatoesSuck/distributed-order-processing/inventory-service/internal/model"
 	"github.com/TomatoesSuck/distributed-order-processing/inventory-service/internal/repository"
 )
 
 type InventoryCommandHandler struct {
-	db                *gorm.DB
-	invRepo           *repository.InventoryRepository
-	logRepo           *repository.InventoryLogRepository
-	pub               *messaging.Publisher
+	invRepo           repository.InventoryRepoIface
+	logRepo           repository.InventoryLogRepoIface
+	pub               messaging.PublisherIface
 	reserveMaxRetries int
 }
 
 func NewInventoryCommandHandler(
-	db *gorm.DB,
-	invRepo *repository.InventoryRepository,
-	logRepo *repository.InventoryLogRepository,
-	pub *messaging.Publisher,
+	invRepo repository.InventoryRepoIface,
+	logRepo repository.InventoryLogRepoIface,
+	pub messaging.PublisherIface,
 	reserveMaxRetries int,
 ) *InventoryCommandHandler {
 	return &InventoryCommandHandler{
-		db:                db,
 		invRepo:           invRepo,
 		logRepo:           logRepo,
 		pub:               pub,
@@ -62,8 +56,6 @@ func (h *InventoryCommandHandler) Handle(ctx context.Context, msg amqp.Delivery)
 	}
 }
 
-var errVersionConflict = errors.New("version conflict")
-
 func (h *InventoryCommandHandler) handleReserve(ctx context.Context, cmd shared.ReserveInventoryCmd) error {
 	// Idempotency: check inventory_logs
 	exists, err := h.logRepo.ExistsReserve(ctx, cmd.OrderID)
@@ -76,7 +68,6 @@ func (h *InventoryCommandHandler) handleReserve(ctx context.Context, cmd shared.
 	}
 
 	for attempt := range h.reserveMaxRetries {
-		// Read current row to get version and check stock.
 		inv, err := h.invRepo.GetByProductID(ctx, cmd.ProductID)
 		if err != nil {
 			return fmt.Errorf("get inventory: %w", err)
@@ -87,36 +78,14 @@ func (h *InventoryCommandHandler) handleReserve(ctx context.Context, cmd shared.
 			return h.publishReserved(ctx, cmd, false, "INSUFFICIENT_STOCK")
 		}
 
-		// Optimistic lock: UPDATE only when version still matches.
-		err = h.db.Transaction(func(tx *gorm.DB) error {
-			result := tx.Model(&model.Inventory{}).
-				Where("product_id = ? AND version = ? AND available_qty >= ?",
-					cmd.ProductID, inv.Version, cmd.Quantity).
-				Updates(map[string]any{
-					"available_qty": gorm.Expr("available_qty - ?", cmd.Quantity),
-					"reserved_qty":  gorm.Expr("reserved_qty + ?", cmd.Quantity),
-					"version":       gorm.Expr("version + 1"),
-				})
-			if result.Error != nil {
-				return fmt.Errorf("update inventory: %w", result.Error)
-			}
-			if result.RowsAffected == 0 {
-				return errVersionConflict
-			}
-			return tx.Create(&model.InventoryLog{
-				ProductID: cmd.ProductID,
-				OrderID:   cmd.OrderID,
-				Action:    model.InventoryActionReserve,
-				Quantity:  cmd.Quantity,
-			}).Error
-		})
-		if err == nil {
+		rowsAffected, err := h.invRepo.ReserveAtomic(ctx, cmd.ProductID, cmd.OrderID, inv.Version, cmd.Quantity)
+		if err != nil {
+			return fmt.Errorf("reserve atomic: %w", err)
+		}
+		if rowsAffected > 0 {
 			log.Printf("inventory: reserved %d units of product %d for order %d (attempt %d)",
 				cmd.Quantity, cmd.ProductID, cmd.OrderID, attempt+1)
 			return h.publishReserved(ctx, cmd, true, "")
-		}
-		if !errors.Is(err, errVersionConflict) {
-			return fmt.Errorf("reserve transaction: %w", err)
 		}
 		log.Printf("inventory: version conflict product=%d attempt=%d/%d, retrying",
 			cmd.ProductID, attempt+1, h.reserveMaxRetries)
@@ -140,28 +109,14 @@ func (h *InventoryCommandHandler) handleRelease(ctx context.Context, cmd shared.
 		return h.publishReleased(ctx, cmd, true, "")
 	}
 
-	if err := h.db.Transaction(func(tx *gorm.DB) error {
-		result := tx.Model(&model.Inventory{}).
-			Where("product_id = ?", cmd.ProductID).
-			Updates(map[string]any{
-				"available_qty": gorm.Expr("available_qty + ?", cmd.Quantity),
-				"reserved_qty":  gorm.Expr("GREATEST(reserved_qty - ?, 0)", cmd.Quantity),
-				"version":       gorm.Expr("version + 1"),
-			})
-		if result.Error != nil {
-			return fmt.Errorf("update inventory: %w", result.Error)
-		}
-		if result.RowsAffected == 0 {
-			return fmt.Errorf("product %d not found", cmd.ProductID)
-		}
-		return tx.Create(&model.InventoryLog{
-			ProductID: cmd.ProductID,
-			OrderID:   cmd.OrderID,
-			Action:    model.InventoryActionRelease,
-			Quantity:  cmd.Quantity,
-		}).Error
-	}); err != nil {
+	rowsAffected, err := h.invRepo.ReleaseAtomic(ctx, cmd.ProductID, cmd.OrderID, cmd.Quantity)
+	if err != nil {
 		log.Printf("inventory: release transaction failed order=%d: %v", cmd.OrderID, err)
+		return h.publishReleased(ctx, cmd, false, err.Error())
+	}
+	if rowsAffected == 0 {
+		err := fmt.Errorf("product %d not found", cmd.ProductID)
+		log.Printf("inventory: release failed order=%d: %v", cmd.OrderID, err)
 		return h.publishReleased(ctx, cmd, false, err.Error())
 	}
 

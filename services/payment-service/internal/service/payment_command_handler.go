@@ -19,22 +19,19 @@ import (
 )
 
 type PaymentCommandHandler struct {
-	db          *gorm.DB
-	paymentRepo *repository.PaymentRepository
-	eventRepo   *repository.ProcessedEventRepository
-	pub         *messaging.Publisher
+	paymentRepo repository.PaymentRepoIface
+	eventRepo   repository.ProcessedEventRepoIface
+	pub         messaging.PublisherIface
 	failureRate float64
 }
 
 func NewPaymentCommandHandler(
-	db *gorm.DB,
-	paymentRepo *repository.PaymentRepository,
-	eventRepo *repository.ProcessedEventRepository,
-	pub *messaging.Publisher,
+	paymentRepo repository.PaymentRepoIface,
+	eventRepo repository.ProcessedEventRepoIface,
+	pub messaging.PublisherIface,
 	failureRate float64,
 ) *PaymentCommandHandler {
 	return &PaymentCommandHandler{
-		db:          db,
 		paymentRepo: paymentRepo,
 		eventRepo:   eventRepo,
 		pub:         pub,
@@ -101,12 +98,7 @@ func (h *PaymentCommandHandler) handleProcess(ctx context.Context, cmd shared.Pr
 			Status:        status,
 			TransactionID: txID,
 		}
-		if err := h.db.Transaction(func(tx *gorm.DB) error {
-			if err := tx.Create(payment).Error; err != nil {
-				return fmt.Errorf("create payment: %w", err)
-			}
-			return repository.MarkProcessed(tx, msgID)
-		}); err != nil {
+		if err := h.paymentRepo.CreatePaymentWithEvent(ctx, payment, msgID); err != nil {
 			return fmt.Errorf("payment transaction: %w", err)
 		}
 		success = !failed

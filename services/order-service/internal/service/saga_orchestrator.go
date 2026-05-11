@@ -4,13 +4,11 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"log"
 	"time"
 
 	amqp "github.com/rabbitmq/amqp091-go"
-	"gorm.io/gorm"
 
 	shared "github.com/TomatoesSuck/distributed-order-processing/shared"
 
@@ -22,19 +20,17 @@ import (
 const recoveryInterval = 30 * time.Second
 
 type SagaOrchestrator struct {
-	db        *gorm.DB
-	sagaRepo  *repository.SagaRepository
-	orderRepo *repository.OrderRepository
-	pub       *messaging.Publisher
+	sagaRepo  repository.SagaRepoIface
+	orderRepo repository.OrderRepoIface
+	pub       messaging.PublisherIface
 }
 
 func NewSagaOrchestrator(
-	db *gorm.DB,
-	sagaRepo *repository.SagaRepository,
-	orderRepo *repository.OrderRepository,
-	pub *messaging.Publisher,
+	sagaRepo repository.SagaRepoIface,
+	orderRepo repository.OrderRepoIface,
+	pub messaging.PublisherIface,
 ) *SagaOrchestrator {
-	return &SagaOrchestrator{db: db, sagaRepo: sagaRepo, orderRepo: orderRepo, pub: pub}
+	return &SagaOrchestrator{sagaRepo: sagaRepo, orderRepo: orderRepo, pub: pub}
 }
 
 // StartSaga writes saga_state then publishes ReserveInventoryCmd.
@@ -105,176 +101,40 @@ func (o *SagaOrchestrator) HandleEvent(ctx context.Context, msg amqp.Delivery) e
 }
 
 func (o *SagaOrchestrator) onInventoryReserved(ctx context.Context, event shared.InventoryReservedEvent, eventID string) error {
-	var (
-		skip       bool
-		amount     float64
-		sagaID     string
-		failed     bool
-		failReason string
-	)
-
-	if err := o.db.Transaction(func(tx *gorm.DB) error {
-		var pe model.ProcessedEvent
-		if err := tx.First(&pe, "event_id = ?", eventID).Error; err == nil {
-			skip = true
-			return nil
-		} else if !errors.Is(err, gorm.ErrRecordNotFound) {
-			return fmt.Errorf("check processed_event: %w", err)
-		}
-
-		var state model.SagaState
-		if err := tx.First(&state, "saga_id = ?", event.SagaID).Error; err != nil {
-			return fmt.Errorf("get saga_state: %w", err)
-		}
-		if state.CurrentStep != model.SagaStepReservingInventory {
-			skip = true
-			return nil
-		}
-
-		sagaID = event.SagaID
-
-		if !event.Success {
-			// Reservation failed → terminal failure, no compensation needed
-			failed = true
-			failReason = event.Reason
-			if err := tx.Model(&model.Order{}).Where("id = ?", event.OrderID).
-				Update("status", model.OrderStatusFailed).Error; err != nil {
-				return fmt.Errorf("update order status FAILED: %w", err)
-			}
-			if err := tx.Model(&state).Updates(map[string]any{
-				"current_step":  model.SagaStepDone,
-				"status":        model.SagaStatusFailed,
-				"last_event_id": eventID,
-				"last_error":    truncate(event.Reason, 500),
-			}).Error; err != nil {
-				return fmt.Errorf("update saga_state FAILED: %w", err)
-			}
-		} else {
-			if err := tx.Model(&model.Order{}).Where("id = ?", event.OrderID).
-				Update("status", model.OrderStatusInventoryReserved).Error; err != nil {
-				return fmt.Errorf("update order status: %w", err)
-			}
-
-			var order model.Order
-			if err := tx.First(&order, event.OrderID).Error; err != nil {
-				return fmt.Errorf("get order: %w", err)
-			}
-			amount = order.TotalAmount
-
-			if err := tx.Model(&state).Updates(map[string]any{
-				"current_step":  model.SagaStepProcessingPayment,
-				"last_event_id": eventID,
-			}).Error; err != nil {
-				return fmt.Errorf("update saga_state: %w", err)
-			}
-		}
-
-		return tx.Create(&model.ProcessedEvent{
-			EventID:    eventID,
-			ConsumedAt: time.Now().UTC(),
-		}).Error
-	}); err != nil {
-		return fmt.Errorf("onInventoryReserved tx: %w", err)
+	out, err := o.sagaRepo.CommitInventoryReserved(ctx, eventID, event)
+	if err != nil {
+		return fmt.Errorf("onInventoryReserved: %w", err)
 	}
-
-	if skip {
+	if out.Skip {
 		return nil
 	}
-
-	if failed {
-		log.Printf("saga: FAILED at RESERVING_INVENTORY saga_id=%s reason=%s", sagaID, failReason)
+	if out.Failed {
+		log.Printf("saga: FAILED at RESERVING_INVENTORY saga_id=%s reason=%s", event.SagaID, event.Reason)
 		return nil
 	}
 
 	cmd := shared.ProcessPaymentCmd{
-		SagaID:  sagaID,
+		SagaID:  event.SagaID,
 		OrderID: event.OrderID,
-		Amount:  amount,
+		Amount:  out.Amount,
 	}
 	if err := o.pub.Publish(ctx, shared.ExchangeCommands, shared.RoutingKeyPaymentProcess, newUUID(), cmd); err != nil {
 		log.Printf("WARN: publish ProcessPaymentCmd failed after DB commit: %v", err)
 		return fmt.Errorf("publish ProcessPaymentCmd: %w", err)
 	}
-	log.Printf("saga: inventory reserved, payment cmd sent saga_id=%s", sagaID)
+	log.Printf("saga: inventory reserved, payment cmd sent saga_id=%s", event.SagaID)
 	return nil
 }
 
 func (o *SagaOrchestrator) onPaymentProcessed(ctx context.Context, event shared.PaymentProcessedEvent, eventID string) error {
-	var (
-		skip       bool
-		compensate bool
-		productID  uint64
-		quantity   int
-	)
-
-	if err := o.db.Transaction(func(tx *gorm.DB) error {
-		var pe model.ProcessedEvent
-		if err := tx.First(&pe, "event_id = ?", eventID).Error; err == nil {
-			skip = true
-			return nil
-		} else if !errors.Is(err, gorm.ErrRecordNotFound) {
-			return fmt.Errorf("check processed_event: %w", err)
-		}
-
-		var state model.SagaState
-		if err := tx.First(&state, "saga_id = ?", event.SagaID).Error; err != nil {
-			return fmt.Errorf("get saga_state: %w", err)
-		}
-		if state.CurrentStep != model.SagaStepProcessingPayment {
-			skip = true
-			return nil
-		}
-
-		if !event.Success {
-			// Payment failed → compensate by releasing inventory
-			compensate = true
-
-			var order model.Order
-			if err := tx.First(&order, event.OrderID).Error; err != nil {
-				return fmt.Errorf("get order: %w", err)
-			}
-			productID = order.ProductID
-			quantity = order.Quantity
-
-			if err := tx.Model(&model.Order{}).Where("id = ?", event.OrderID).
-				Update("status", model.OrderStatusFailed).Error; err != nil {
-				return fmt.Errorf("update order status FAILED: %w", err)
-			}
-			if err := tx.Model(&state).Updates(map[string]any{
-				"current_step":  model.SagaStepReleasingInventory,
-				"status":        model.SagaStatusCompensating,
-				"last_event_id": eventID,
-				"last_error":    truncate(event.Reason, 500),
-			}).Error; err != nil {
-				return fmt.Errorf("update saga_state COMPENSATING: %w", err)
-			}
-		} else {
-			if err := tx.Model(&model.Order{}).Where("id = ?", event.OrderID).
-				Update("status", model.OrderStatusConfirmed).Error; err != nil {
-				return fmt.Errorf("update order status: %w", err)
-			}
-			if err := tx.Model(&state).Updates(map[string]any{
-				"current_step":  model.SagaStepDone,
-				"status":        model.SagaStatusCompleted,
-				"last_event_id": eventID,
-			}).Error; err != nil {
-				return fmt.Errorf("update saga_state: %w", err)
-			}
-		}
-
-		return tx.Create(&model.ProcessedEvent{
-			EventID:    eventID,
-			ConsumedAt: time.Now().UTC(),
-		}).Error
-	}); err != nil {
-		return fmt.Errorf("onPaymentProcessed tx: %w", err)
+	out, err := o.sagaRepo.CommitPaymentProcessed(ctx, eventID, event)
+	if err != nil {
+		return fmt.Errorf("onPaymentProcessed: %w", err)
 	}
-
-	if skip {
+	if out.Skip {
 		return nil
 	}
-
-	if !compensate {
+	if !out.Compensate {
 		log.Printf("saga: COMPLETED saga_id=%s order_id=%d", event.SagaID, event.OrderID)
 		return nil
 	}
@@ -282,8 +142,8 @@ func (o *SagaOrchestrator) onPaymentProcessed(ctx context.Context, event shared.
 	cmd := shared.ReleaseInventoryCmd{
 		SagaID:    event.SagaID,
 		OrderID:   event.OrderID,
-		ProductID: productID,
-		Quantity:  quantity,
+		ProductID: out.ProductID,
+		Quantity:  out.Quantity,
 	}
 	if err := o.pub.Publish(ctx, shared.ExchangeCommands, shared.RoutingKeyInventoryRelease, newUUID(), cmd); err != nil {
 		log.Printf("WARN: publish ReleaseInventoryCmd failed after DB commit: %v", err)
@@ -294,65 +154,14 @@ func (o *SagaOrchestrator) onPaymentProcessed(ctx context.Context, event shared.
 }
 
 func (o *SagaOrchestrator) onInventoryReleased(ctx context.Context, event shared.InventoryReleasedEvent, eventID string) error {
-	var (
-		skip          bool
-		releaseFailed bool
-	)
-
-	if err := o.db.Transaction(func(tx *gorm.DB) error {
-		var pe model.ProcessedEvent
-		if err := tx.First(&pe, "event_id = ?", eventID).Error; err == nil {
-			skip = true
-			return nil
-		} else if !errors.Is(err, gorm.ErrRecordNotFound) {
-			return fmt.Errorf("check processed_event: %w", err)
-		}
-
-		var state model.SagaState
-		if err := tx.First(&state, "saga_id = ?", event.SagaID).Error; err != nil {
-			return fmt.Errorf("get saga_state: %w", err)
-		}
-		if state.Status != model.SagaStatusCompensating || state.CurrentStep != model.SagaStepReleasingInventory {
-			skip = true
-			return nil
-		}
-
-		if event.Success {
-			if err := tx.Model(&model.Order{}).Where("id = ?", event.OrderID).
-				Update("status", model.OrderStatusCompensated).Error; err != nil {
-				return fmt.Errorf("update order status COMPENSATED: %w", err)
-			}
-			if err := tx.Model(&state).Updates(map[string]any{
-				"current_step":  model.SagaStepDone,
-				"status":        model.SagaStatusCompensated,
-				"last_event_id": eventID,
-			}).Error; err != nil {
-				return fmt.Errorf("update saga_state COMPENSATED: %w", err)
-			}
-		} else {
-			releaseFailed = true
-			if err := tx.Model(&state).Updates(map[string]any{
-				"current_step":  model.SagaStepDone,
-				"status":        model.SagaStatusFailed,
-				"last_event_id": eventID,
-				"last_error":    truncate("compensation failed: "+event.Reason, 500),
-			}).Error; err != nil {
-				return fmt.Errorf("update saga_state FAILED (compensation): %w", err)
-			}
-		}
-
-		return tx.Create(&model.ProcessedEvent{
-			EventID:    eventID,
-			ConsumedAt: time.Now().UTC(),
-		}).Error
-	}); err != nil {
-		return fmt.Errorf("onInventoryReleased tx: %w", err)
+	out, err := o.sagaRepo.CommitInventoryReleased(ctx, eventID, event)
+	if err != nil {
+		return fmt.Errorf("onInventoryReleased: %w", err)
 	}
-
-	if skip {
+	if out.Skip {
 		return nil
 	}
-	if releaseFailed {
+	if out.Failed {
 		log.Printf("ERROR: saga compensation failed saga_id=%s reason=%s — manual intervention required",
 			event.SagaID, event.Reason)
 		return nil
@@ -458,13 +267,6 @@ func (o *SagaOrchestrator) recoverCompensating(ctx context.Context, s model.Saga
 	}
 	log.Printf("saga recovery: re-sent ReleaseInventoryCmd saga_id=%s", s.SagaID)
 	return nil
-}
-
-func truncate(s string, max int) string {
-	if len(s) <= max {
-		return s
-	}
-	return s[:max]
 }
 
 func newUUID() string {

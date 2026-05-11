@@ -10,6 +10,11 @@ import (
 	amqp "github.com/rabbitmq/amqp091-go"
 )
 
+// PublisherIface is the surface SagaOrchestrator depends on; allows mocking.
+type PublisherIface interface {
+	Publish(ctx context.Context, exchange, routingKey, messageID string, payload any) error
+}
+
 type Publisher struct {
 	mq *MQ
 }

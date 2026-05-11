@@ -56,7 +56,7 @@ func main() {
 	orderRepo := repository.NewOrderRepository(database)
 	sagaRepo := repository.NewSagaRepository(database)
 	orderSvc := service.NewOrderService(orderRepo)
-	orchestrator := service.NewSagaOrchestrator(database, sagaRepo, orderRepo, pub)
+	orchestrator := service.NewSagaOrchestrator(sagaRepo, orderRepo, pub)
 
 	h := handler.NewOrderHandler(orderSvc, orchestrator)
 	adminH := handler.NewAdminHandler(sagaRepo, orderRepo)

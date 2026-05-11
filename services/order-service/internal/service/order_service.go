@@ -9,10 +9,10 @@ import (
 )
 
 type OrderService struct {
-	repo *repository.OrderRepository
+	repo repository.OrderRepoIface
 }
 
-func NewOrderService(repo *repository.OrderRepository) *OrderService {
+func NewOrderService(repo repository.OrderRepoIface) *OrderService {
 	return &OrderService{repo: repo}
 }
 
