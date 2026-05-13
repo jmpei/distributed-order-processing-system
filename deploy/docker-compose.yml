@@ -7,6 +7,8 @@ volumes:
   mysql-inventory-data:
   mysql-payment-data:
   rabbitmq-data:
+  prometheus-data:
+  grafana-data:
 
 services:
   # ── MySQL ────────────────────────────────────────────────────
@@ -168,3 +170,41 @@ services:
       timeout: 3s
       retries: 5
       start_period: 15s
+
+  # ── Observability (Phase 7) ──────────────────────────────────
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --web.enable-lifecycle
+    networks:
+      - order-net
+    depends_on:
+      - order-service
+      - inventory-service
+      - payment-service
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_USERS_DEFAULT_THEME: light
+    volumes:
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    networks:
+      - order-net
+    depends_on:
+      - prometheus
