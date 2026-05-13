@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"testing"
+	"time"
 
 	amqp "github.com/rabbitmq/amqp091-go"
 	"github.com/stretchr/testify/assert"
@@ -131,7 +132,7 @@ func TestRecoverSaga_FromCrashedState(t *testing.T) {
 			return ok && c.SagaID == "saga-3" && c.OrderID == 3 && c.Quantity == 3
 		})).Return(nil).Once()
 
-	o := NewSagaOrchestrator(sagaRepo, orderRepo, pub)
+	o := NewSagaOrchestrator(sagaRepo, orderRepo, pub, nil)
 	o.runRecovery(context.Background())
 
 	sagaRepo.AssertExpectations(t)
@@ -172,7 +173,7 @@ func TestHandlePaymentFailedEvent_TriggersCompensation(t *testing.T) {
 			return ok && c.SagaID == "saga-99" && c.OrderID == 99 && c.ProductID == 1001 && c.Quantity == 2
 		})).Return(nil).Once()
 
-	o := NewSagaOrchestrator(sagaRepo, orderRepo, pub)
+	o := NewSagaOrchestrator(sagaRepo, orderRepo, pub, nil)
 	err := o.onPaymentProcessed(context.Background(), event, eventID)
 
 	assert.NoError(t, err)
@@ -196,7 +197,7 @@ func TestStartSaga(t *testing.T) {
 			return ok && c.OrderID == 11 && c.ProductID == 1001 && c.Quantity == 2
 		})).Return(nil).Once()
 
-	o := NewSagaOrchestrator(sagaRepo, orderRepo, pub)
+	o := NewSagaOrchestrator(sagaRepo, orderRepo, pub, nil)
 	assert.NoError(t, o.StartSaga(context.Background(), order))
 	sagaRepo.AssertExpectations(t)
 	pub.AssertExpectations(t)
@@ -219,7 +220,7 @@ func TestOnInventoryReserved_Success(t *testing.T) {
 			return ok && c.SagaID == "saga-7" && c.Amount == 200
 		})).Return(nil).Once()
 
-	o := NewSagaOrchestrator(sagaRepo, orderRepo, pub)
+	o := NewSagaOrchestrator(sagaRepo, orderRepo, pub, nil)
 	assert.NoError(t, o.onInventoryReserved(context.Background(), event, "evt-7"))
 	sagaRepo.AssertExpectations(t)
 	pub.AssertExpectations(t)
@@ -234,8 +235,11 @@ func TestOnInventoryReleased_Success(t *testing.T) {
 	event := shared.InventoryReleasedEvent{SagaID: "saga-8", OrderID: 8, Success: true}
 	sagaRepo.On("CommitInventoryReleased", mock.Anything, "evt-8", event).
 		Return(repository.InventoryReleasedOutcome{}, nil).Once()
+	// recordTerminal looks the saga up to compute saga_duration_seconds.
+	sagaRepo.On("GetBySagaID", mock.Anything, "saga-8").
+		Return(&model.SagaState{SagaID: "saga-8", CreatedAt: time.Now()}, nil).Maybe()
 
-	o := NewSagaOrchestrator(sagaRepo, orderRepo, pub)
+	o := NewSagaOrchestrator(sagaRepo, orderRepo, pub, nil)
 	assert.NoError(t, o.onInventoryReleased(context.Background(), event, "evt-8"))
 	sagaRepo.AssertExpectations(t)
 	pub.AssertNotCalled(t, "Publish")
@@ -252,8 +256,11 @@ func TestHandleEvent_DispatchRouting(t *testing.T) {
 
 	sagaRepo.On("CommitPaymentProcessed", mock.Anything, "evt-x", event).
 		Return(repository.PaymentProcessedOutcome{}, nil).Once()
+	// payment-processed with !Compensate is a COMPLETED terminal; recordTerminal looks the saga up.
+	sagaRepo.On("GetBySagaID", mock.Anything, "s").
+		Return(&model.SagaState{SagaID: "s", CreatedAt: time.Now()}, nil).Maybe()
 
-	o := NewSagaOrchestrator(sagaRepo, orderRepo, pub)
+	o := NewSagaOrchestrator(sagaRepo, orderRepo, pub, nil)
 
 	// Routing key → onPaymentProcessed.
 	err := o.HandleEvent(context.Background(), amqp.Delivery{

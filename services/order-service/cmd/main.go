@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"log"
 	"net/http"
 	"os"
 	"os/signal"
@@ -10,6 +9,8 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"go.uber.org/zap"
 
 	"github.com/TomatoesSuck/distributed-order-processing/order-service/internal/config"
 	"github.com/TomatoesSuck/distributed-order-processing/order-service/internal/db"
@@ -19,44 +20,53 @@ import (
 	"github.com/TomatoesSuck/distributed-order-processing/order-service/internal/repository"
 	"github.com/TomatoesSuck/distributed-order-processing/order-service/internal/service"
 	shared "github.com/TomatoesSuck/distributed-order-processing/shared"
+	"github.com/TomatoesSuck/distributed-order-processing/shared/observability"
 )
 
+const serviceName = "order"
+
 func main() {
+	logger, err := observability.NewLogger(serviceName)
+	if err != nil {
+		panic("zap init: " + err.Error())
+	}
+	defer logger.Sync() //nolint:errcheck // best-effort flush on exit
+
 	cfg := config.Load()
 
 	// ── Database ─────────────────────────────────────────────────
 	database, err := db.Connect(cfg)
 	if err != nil {
-		log.Fatalf("service=order db connect: %v", err)
+		logger.Fatal("db connect", zap.Error(err))
 	}
 	sqlDB, err := database.DB()
 	if err != nil {
-		log.Fatalf("service=order get sql.DB: %v", err)
+		logger.Fatal("get sql.DB", zap.Error(err))
 	}
 	defer sqlDB.Close()
 
 	if err := database.AutoMigrate(&model.Order{}, &model.SagaState{}, &model.ProcessedEvent{}); err != nil {
-		log.Fatalf("service=order automigrate: %v", err)
+		logger.Fatal("automigrate", zap.Error(err))
 	}
 
 	// ── RabbitMQ ─────────────────────────────────────────────────
 	mq, err := messaging.New(cfg.RabbitMQURL)
 	if err != nil {
-		log.Fatalf("service=order amqp connect: %v", err)
+		logger.Fatal("amqp connect", zap.Error(err))
 	}
 	defer mq.Close()
 
 	if err := messaging.Setup(mq); err != nil {
-		log.Fatalf("service=order amqp topology: %v", err)
+		logger.Fatal("amqp topology", zap.Error(err))
 	}
 
 	// ── Wiring ───────────────────────────────────────────────────
-	pub := messaging.NewPublisher(mq)
+	pub := messaging.NewPublisher(mq, logger)
 
 	orderRepo := repository.NewOrderRepository(database)
 	sagaRepo := repository.NewSagaRepository(database)
 	orderSvc := service.NewOrderService(orderRepo)
-	orchestrator := service.NewSagaOrchestrator(sagaRepo, orderRepo, pub)
+	orchestrator := service.NewSagaOrchestrator(sagaRepo, orderRepo, pub, logger)
 
 	h := handler.NewOrderHandler(orderSvc, orchestrator)
 	adminH := handler.NewAdminHandler(sagaRepo, orderRepo)
@@ -65,28 +75,30 @@ func main() {
 	consumerCtx, stopConsumers := context.WithCancel(context.Background())
 	defer stopConsumers()
 
-	if err := messaging.StartConsumer(consumerCtx, mq, shared.QueueOrderEvents, orchestrator.HandleEvent); err != nil {
-		log.Fatalf("service=order start consumer: %v", err)
+	if err := messaging.StartConsumer(consumerCtx, mq, shared.QueueOrderEvents, logger, orchestrator.HandleEvent); err != nil {
+		logger.Fatal("start consumer", zap.Error(err))
 	}
-	log.Printf("service=order consumer started on %s", shared.QueueOrderEvents)
+	logger.Info("consumer started", zap.String("queue", shared.QueueOrderEvents))
 
 	go orchestrator.RecoverInProgressSagas(consumerCtx)
-	log.Printf("service=order saga recovery loop started")
+	logger.Info("saga recovery loop started")
 
 	// ── HTTP ─────────────────────────────────────────────────────
 	r := gin.New()
 	r.Use(gin.Recovery())
+	r.Use(observability.GinMiddleware(serviceName, logger))
+	r.GET("/metrics", gin.WrapH(promhttp.Handler()))
 	r.GET("/health", func(c *gin.Context) {
-		c.JSON(http.StatusOK, gin.H{"status": "ok", "service": "order"})
+		c.JSON(http.StatusOK, gin.H{"status": "ok", "service": serviceName})
 	})
 	h.Register(r)
 	adminH.Register(r)
 
 	srv := &http.Server{Addr: ":" + cfg.Port, Handler: r}
 	go func() {
-		log.Printf("service=order port=%s starting", cfg.Port)
+		logger.Info("http listening", zap.String("port", cfg.Port))
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("service=order listen: %v", err)
+			logger.Fatal("listen", zap.Error(err))
 		}
 	}()
 
@@ -100,7 +112,7 @@ func main() {
 	shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := srv.Shutdown(shutCtx); err != nil {
-		log.Fatalf("service=order forced shutdown: %v", err)
+		logger.Fatal("forced shutdown", zap.Error(err))
 	}
-	log.Println("service=order exited")
+	logger.Info("exited")
 }

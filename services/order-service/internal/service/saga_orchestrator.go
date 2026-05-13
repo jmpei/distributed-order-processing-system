@@ -5,12 +5,13 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"fmt"
-	"log"
 	"time"
 
 	amqp "github.com/rabbitmq/amqp091-go"
+	"go.uber.org/zap"
 
 	shared "github.com/TomatoesSuck/distributed-order-processing/shared"
+	"github.com/TomatoesSuck/distributed-order-processing/shared/observability"
 
 	"github.com/TomatoesSuck/distributed-order-processing/order-service/internal/messaging"
 	"github.com/TomatoesSuck/distributed-order-processing/order-service/internal/model"
@@ -23,14 +24,19 @@ type SagaOrchestrator struct {
 	sagaRepo  repository.SagaRepoIface
 	orderRepo repository.OrderRepoIface
 	pub       messaging.PublisherIface
+	logger    *zap.Logger
 }
 
 func NewSagaOrchestrator(
 	sagaRepo repository.SagaRepoIface,
 	orderRepo repository.OrderRepoIface,
 	pub messaging.PublisherIface,
+	logger *zap.Logger,
 ) *SagaOrchestrator {
-	return &SagaOrchestrator{sagaRepo: sagaRepo, orderRepo: orderRepo, pub: pub}
+	if logger == nil {
+		logger = zap.NewNop()
+	}
+	return &SagaOrchestrator{sagaRepo: sagaRepo, orderRepo: orderRepo, pub: pub, logger: logger}
 }
 
 // StartSaga writes saga_state then publishes ReserveInventoryCmd.
@@ -46,6 +52,8 @@ func (o *SagaOrchestrator) StartSaga(ctx context.Context, order *model.Order) er
 		return fmt.Errorf("start saga: %w", err)
 	}
 
+	ctx = observability.WithSagaID(ctx, sagaID)
+
 	cmd := shared.ReserveInventoryCmd{
 		SagaID:    sagaID,
 		OrderID:   order.ID,
@@ -55,7 +63,7 @@ func (o *SagaOrchestrator) StartSaga(ctx context.Context, order *model.Order) er
 	if err := o.pub.Publish(ctx, shared.ExchangeCommands, shared.RoutingKeyInventoryReserve, newUUID(), cmd); err != nil {
 		return fmt.Errorf("publish ReserveInventoryCmd: %w", err)
 	}
-	log.Printf("saga started saga_id=%s order_id=%d", sagaID, order.ID)
+	observability.LoggerFrom(ctx).Info("saga started", zap.Uint64("order_id", order.ID))
 	return nil
 }
 
@@ -68,7 +76,8 @@ func (o *SagaOrchestrator) HandleEvent(ctx context.Context, msg amqp.Delivery) e
 		}
 	}
 	if eventID == "" {
-		log.Printf("saga event has no message_id, skipping (routing_key=%s)", msg.RoutingKey)
+		observability.LoggerFrom(ctx).Warn("saga event missing message_id, skipping",
+			zap.String("routing_key", msg.RoutingKey))
 		return nil
 	}
 
@@ -95,7 +104,8 @@ func (o *SagaOrchestrator) HandleEvent(ctx context.Context, msg amqp.Delivery) e
 		return o.onInventoryReleased(ctx, event, eventID)
 
 	default:
-		log.Printf("saga: unknown routing key %s, skipping", msg.RoutingKey)
+		observability.LoggerFrom(ctx).Warn("saga: unknown routing key, skipping",
+			zap.String("routing_key", msg.RoutingKey))
 		return nil
 	}
 }
@@ -109,7 +119,7 @@ func (o *SagaOrchestrator) onInventoryReserved(ctx context.Context, event shared
 		return nil
 	}
 	if out.Failed {
-		log.Printf("saga: FAILED at RESERVING_INVENTORY saga_id=%s reason=%s", event.SagaID, event.Reason)
+		o.recordTerminal(ctx, event.SagaID, model.SagaStatusFailed, "RESERVING_INVENTORY", event.Reason)
 		return nil
 	}
 
@@ -119,10 +129,10 @@ func (o *SagaOrchestrator) onInventoryReserved(ctx context.Context, event shared
 		Amount:  out.Amount,
 	}
 	if err := o.pub.Publish(ctx, shared.ExchangeCommands, shared.RoutingKeyPaymentProcess, newUUID(), cmd); err != nil {
-		log.Printf("WARN: publish ProcessPaymentCmd failed after DB commit: %v", err)
+		observability.LoggerFrom(ctx).Warn("publish ProcessPaymentCmd failed after DB commit", zap.Error(err))
 		return fmt.Errorf("publish ProcessPaymentCmd: %w", err)
 	}
-	log.Printf("saga: inventory reserved, payment cmd sent saga_id=%s", event.SagaID)
+	observability.LoggerFrom(ctx).Info("saga: inventory reserved, payment cmd sent")
 	return nil
 }
 
@@ -135,7 +145,7 @@ func (o *SagaOrchestrator) onPaymentProcessed(ctx context.Context, event shared.
 		return nil
 	}
 	if !out.Compensate {
-		log.Printf("saga: COMPLETED saga_id=%s order_id=%d", event.SagaID, event.OrderID)
+		o.recordTerminal(ctx, event.SagaID, model.SagaStatusCompleted, "DONE", "")
 		return nil
 	}
 
@@ -146,10 +156,11 @@ func (o *SagaOrchestrator) onPaymentProcessed(ctx context.Context, event shared.
 		Quantity:  out.Quantity,
 	}
 	if err := o.pub.Publish(ctx, shared.ExchangeCommands, shared.RoutingKeyInventoryRelease, newUUID(), cmd); err != nil {
-		log.Printf("WARN: publish ReleaseInventoryCmd failed after DB commit: %v", err)
+		observability.LoggerFrom(ctx).Warn("publish ReleaseInventoryCmd failed after DB commit", zap.Error(err))
 		return fmt.Errorf("publish ReleaseInventoryCmd: %w", err)
 	}
-	log.Printf("saga: COMPENSATING saga_id=%s reason=%s release_cmd sent", event.SagaID, event.Reason)
+	observability.LoggerFrom(ctx).Info("saga: COMPENSATING, release cmd sent",
+		zap.String("reason", event.Reason))
 	return nil
 }
 
@@ -162,12 +173,35 @@ func (o *SagaOrchestrator) onInventoryReleased(ctx context.Context, event shared
 		return nil
 	}
 	if out.Failed {
-		log.Printf("ERROR: saga compensation failed saga_id=%s reason=%s — manual intervention required",
-			event.SagaID, event.Reason)
+		// Saga compensation itself failed — mark FAILED, record metric, alert via log.
+		observability.LoggerFrom(ctx).Error("saga compensation failed, manual intervention required",
+			zap.String("reason", event.Reason))
+		o.recordTerminal(ctx, event.SagaID, model.SagaStatusFailed, "RELEASING_INVENTORY", event.Reason)
 		return nil
 	}
-	log.Printf("saga: COMPENSATED saga_id=%s order_id=%d", event.SagaID, event.OrderID)
+	o.recordTerminal(ctx, event.SagaID, model.SagaStatusCompensated, "DONE", "")
 	return nil
+}
+
+// recordTerminal centralises the metric + log for any terminal saga state.
+// It looks up the saga to compute end-to-end duration; the extra read is
+// negligible against the 1 query/saga we already do for state transitions.
+func (o *SagaOrchestrator) recordTerminal(ctx context.Context, sagaID, status, step, reason string) {
+	observability.SagaTotal.WithLabelValues(status).Inc()
+
+	if s, err := o.sagaRepo.GetBySagaID(ctx, sagaID); err == nil {
+		observability.SagaDuration.WithLabelValues(status).
+			Observe(time.Since(s.CreatedAt).Seconds())
+	}
+
+	fields := []zap.Field{
+		zap.String("status", status),
+		zap.String("step", step),
+	}
+	if reason != "" {
+		fields = append(fields, zap.String("reason", reason))
+	}
+	observability.LoggerFrom(ctx).Info("saga: terminal", fields...)
 }
 
 // RecoverInProgressSagas resumes interrupted sagas by re-publishing the command
@@ -181,7 +215,7 @@ func (o *SagaOrchestrator) RecoverInProgressSagas(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
-			log.Printf("saga: recovery loop stopped")
+			o.logger.Info("saga recovery loop stopped")
 			return
 		case <-t.C:
 			o.runRecovery(ctx)
@@ -192,28 +226,40 @@ func (o *SagaOrchestrator) RecoverInProgressSagas(ctx context.Context) {
 func (o *SagaOrchestrator) runRecovery(ctx context.Context) {
 	inProgress, err := o.sagaRepo.ListByStatus(ctx, model.SagaStatusInProgress)
 	if err != nil {
-		log.Printf("saga recovery: list IN_PROGRESS: %v", err)
+		o.logger.Warn("saga recovery: list IN_PROGRESS", zap.Error(err))
 	} else {
 		for _, s := range inProgress {
 			if err := o.recoverInProgress(ctx, s); err != nil {
-				log.Printf("saga recovery: saga_id=%s step=%s: %v", s.SagaID, s.CurrentStep, err)
+				o.logger.Warn("saga recovery",
+					zap.String("saga_id", s.SagaID),
+					zap.String("step", s.CurrentStep),
+					zap.Error(err))
 			}
 		}
 	}
 
 	compensating, err := o.sagaRepo.ListByStatus(ctx, model.SagaStatusCompensating)
 	if err != nil {
-		log.Printf("saga recovery: list COMPENSATING: %v", err)
+		o.logger.Warn("saga recovery: list COMPENSATING", zap.Error(err))
 		return
 	}
 	for _, s := range compensating {
 		if err := o.recoverCompensating(ctx, s); err != nil {
-			log.Printf("saga recovery: saga_id=%s step=%s: %v", s.SagaID, s.CurrentStep, err)
+			o.logger.Warn("saga recovery",
+				zap.String("saga_id", s.SagaID),
+				zap.String("step", s.CurrentStep),
+				zap.Error(err))
 		}
 	}
 }
 
 func (o *SagaOrchestrator) recoverInProgress(ctx context.Context, s model.SagaState) error {
+	// Recovery runs outside any HTTP request — seed a fresh ctx with
+	// the orchestrator's base logger + the saga_id so re-publish logs
+	// remain correlatable.
+	ctx = observability.WithLogger(ctx, o.logger)
+	ctx = observability.WithSagaID(ctx, s.SagaID)
+
 	order, err := o.orderRepo.GetByID(ctx, s.OrderID)
 	if err != nil {
 		return fmt.Errorf("get order: %w", err)
@@ -230,7 +276,7 @@ func (o *SagaOrchestrator) recoverInProgress(ctx context.Context, s model.SagaSt
 		if err := o.pub.Publish(ctx, shared.ExchangeCommands, shared.RoutingKeyInventoryReserve, newUUID(), cmd); err != nil {
 			return fmt.Errorf("republish ReserveInventoryCmd: %w", err)
 		}
-		log.Printf("saga recovery: re-sent ReserveInventoryCmd saga_id=%s", s.SagaID)
+		observability.LoggerFrom(ctx).Info("saga recovery: re-sent ReserveInventoryCmd")
 	case model.SagaStepProcessingPayment:
 		cmd := shared.ProcessPaymentCmd{
 			SagaID:  s.SagaID,
@@ -240,16 +286,21 @@ func (o *SagaOrchestrator) recoverInProgress(ctx context.Context, s model.SagaSt
 		if err := o.pub.Publish(ctx, shared.ExchangeCommands, shared.RoutingKeyPaymentProcess, newUUID(), cmd); err != nil {
 			return fmt.Errorf("republish ProcessPaymentCmd: %w", err)
 		}
-		log.Printf("saga recovery: re-sent ProcessPaymentCmd saga_id=%s", s.SagaID)
+		observability.LoggerFrom(ctx).Info("saga recovery: re-sent ProcessPaymentCmd")
 	default:
-		log.Printf("saga recovery: skipping IN_PROGRESS saga_id=%s with unexpected step=%s", s.SagaID, s.CurrentStep)
+		observability.LoggerFrom(ctx).Warn("saga recovery: skipping IN_PROGRESS with unexpected step",
+			zap.String("step", s.CurrentStep))
 	}
 	return nil
 }
 
 func (o *SagaOrchestrator) recoverCompensating(ctx context.Context, s model.SagaState) error {
+	ctx = observability.WithLogger(ctx, o.logger)
+	ctx = observability.WithSagaID(ctx, s.SagaID)
+
 	if s.CurrentStep != model.SagaStepReleasingInventory {
-		log.Printf("saga recovery: skipping COMPENSATING saga_id=%s with unexpected step=%s", s.SagaID, s.CurrentStep)
+		observability.LoggerFrom(ctx).Warn("saga recovery: skipping COMPENSATING with unexpected step",
+			zap.String("step", s.CurrentStep))
 		return nil
 	}
 	order, err := o.orderRepo.GetByID(ctx, s.OrderID)
@@ -265,7 +316,7 @@ func (o *SagaOrchestrator) recoverCompensating(ctx context.Context, s model.Saga
 	if err := o.pub.Publish(ctx, shared.ExchangeCommands, shared.RoutingKeyInventoryRelease, newUUID(), cmd); err != nil {
 		return fmt.Errorf("republish ReleaseInventoryCmd: %w", err)
 	}
-	log.Printf("saga recovery: re-sent ReleaseInventoryCmd saga_id=%s", s.SagaID)
+	observability.LoggerFrom(ctx).Info("saga recovery: re-sent ReleaseInventoryCmd")
 	return nil
 }
 

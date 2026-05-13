@@ -3,15 +3,30 @@ package messaging
 import (
 	"context"
 	"fmt"
-	"log"
 	"time"
 
 	amqp "github.com/rabbitmq/amqp091-go"
+	"go.uber.org/zap"
+
+	"github.com/TomatoesSuck/distributed-order-processing/shared/observability"
 )
 
 type HandlerFunc func(ctx context.Context, msg amqp.Delivery) error
 
-func StartConsumer(ctx context.Context, mq *MQ, queue string, handler HandlerFunc) error {
+// StartConsumer starts a goroutine that consumes from queue and calls handler.
+// On handler error: nack (requeue=false → dead-letter queue).
+// On panic: recover, nack.
+// On channel close: reconnect up to 5 times, then panic.
+//
+// `logger` is the per-service base logger; trace_id and saga_id pulled from
+// the AMQP headers are bound to it before each message is dispatched, so
+// `observability.LoggerFrom(ctx)` inside the handler emits them automatically.
+func StartConsumer(ctx context.Context, mq *MQ, queue string, logger *zap.Logger, handler HandlerFunc) error {
+	if logger == nil {
+		logger = zap.NewNop()
+	}
+	logger = logger.With(zap.String("queue", queue))
+
 	ch, msgs, err := openConsumerCh(mq, queue)
 	if err != nil {
 		return err
@@ -28,8 +43,8 @@ func StartConsumer(ctx context.Context, mq *MQ, queue string, handler HandlerFun
 			case msg, ok := <-currentMsgs:
 				if !ok {
 					currentCh.Close()
-					log.Printf("consumer %s: channel closed, reconnecting...", queue)
-					newCh, newMsgs, err := reconnectConsumer(mq, queue)
+					logger.Warn("channel closed, reconnecting")
+					newCh, newMsgs, err := reconnectConsumer(mq, queue, logger)
 					if err != nil {
 						panic(fmt.Sprintf("consumer %s reconnect failed: %v", queue, err))
 					}
@@ -37,7 +52,7 @@ func StartConsumer(ctx context.Context, mq *MQ, queue string, handler HandlerFun
 					currentMsgs = newMsgs
 					continue
 				}
-				dispatchMsg(msg, handler)
+				dispatchMsg(ctx, msg, logger, handler)
 			}
 		}
 	}()
@@ -45,17 +60,26 @@ func StartConsumer(ctx context.Context, mq *MQ, queue string, handler HandlerFun
 	return nil
 }
 
-func dispatchMsg(msg amqp.Delivery, handler HandlerFunc) {
+func dispatchMsg(parent context.Context, msg amqp.Delivery, logger *zap.Logger, handler HandlerFunc) {
 	defer func() {
 		if r := recover(); r != nil {
-			log.Printf("panic in consumer handler, nacking: %v", r)
+			logger.Error("panic in consumer handler, nacking",
+				zap.Any("panic", r),
+				zap.String("routing_key", msg.RoutingKey),
+			)
 			_ = msg.Nack(false, false)
 		}
 	}()
 
-	ctx := context.Background()
+	// Seed ctx with trace_id + saga_id from message headers so the handler's
+	// LoggerFrom(ctx) emits them, and any downstream publish carries them on.
+	ctx := observability.ExtractAMQPHeaders(parent, logger, msg.Headers)
+
 	if err := handler(ctx, msg); err != nil {
-		log.Printf("handler error, nacking (routing_key=%s): %v", msg.RoutingKey, err)
+		observability.LoggerFrom(ctx).Error("handler error, nacking",
+			zap.String("routing_key", msg.RoutingKey),
+			zap.Error(err),
+		)
 		_ = msg.Nack(false, false)
 		return
 	}
@@ -79,15 +103,15 @@ func openConsumerCh(mq *MQ, queue string) (*amqp.Channel, <-chan amqp.Delivery, 
 	return ch, msgs, nil
 }
 
-func reconnectConsumer(mq *MQ, queue string) (*amqp.Channel, <-chan amqp.Delivery, error) {
+func reconnectConsumer(mq *MQ, queue string, logger *zap.Logger) (*amqp.Channel, <-chan amqp.Delivery, error) {
 	backoff := time.Second
 	for i := 1; i <= 5; i++ {
 		ch, msgs, err := openConsumerCh(mq, queue)
 		if err == nil {
-			log.Printf("consumer %s: reconnected (attempt %d)", queue, i)
+			logger.Info("reconnected", zap.Int("attempt", i))
 			return ch, msgs, nil
 		}
-		log.Printf("consumer %s: reconnect attempt %d/5 failed: %v", queue, i, err)
+		logger.Warn("reconnect attempt failed", zap.Int("attempt", i), zap.Error(err))
 		time.Sleep(backoff)
 		backoff *= 2
 	}

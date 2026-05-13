@@ -4,10 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
 	"time"
 
 	amqp "github.com/rabbitmq/amqp091-go"
+	"go.uber.org/zap"
+
+	"github.com/TomatoesSuck/distributed-order-processing/shared/observability"
 )
 
 // PublisherIface is the surface SagaOrchestrator depends on; allows mocking.
@@ -16,11 +18,15 @@ type PublisherIface interface {
 }
 
 type Publisher struct {
-	mq *MQ
+	mq     *MQ
+	logger *zap.Logger
 }
 
-func NewPublisher(mq *MQ) *Publisher {
-	return &Publisher{mq: mq}
+func NewPublisher(mq *MQ, logger *zap.Logger) *Publisher {
+	if logger == nil {
+		logger = zap.NewNop()
+	}
+	return &Publisher{mq: mq, logger: logger}
 }
 
 func (p *Publisher) Publish(ctx context.Context, exchange, routingKey, messageID string, payload any) error {
@@ -33,7 +39,12 @@ func (p *Publisher) Publish(ctx context.Context, exchange, routingKey, messageID
 	for attempt := 1; attempt <= 3; attempt++ {
 		if err := p.publishOnce(ctx, exchange, routingKey, messageID, body); err != nil {
 			lastErr = err
-			log.Printf("publish attempt %d/3 failed (exchange=%s key=%s): %v", attempt, exchange, routingKey, err)
+			observability.LoggerFrom(ctx).Warn("publish attempt failed",
+				zap.Int("attempt", attempt),
+				zap.String("exchange", exchange),
+				zap.String("routing_key", routingKey),
+				zap.Error(err),
+			)
 			select {
 			case <-ctx.Done():
 				return ctx.Err()
@@ -59,12 +70,14 @@ func (p *Publisher) publishOnce(ctx context.Context, exchange, routingKey, messa
 
 	confirms := ch.NotifyPublish(make(chan amqp.Confirmation, 1))
 
+	headers := observability.InjectAMQPHeaders(ctx, amqp.Table{"message_id": messageID})
+
 	if err := ch.PublishWithContext(ctx, exchange, routingKey, false, false, amqp.Publishing{
 		DeliveryMode: amqp.Persistent,
 		MessageId:    messageID,
 		ContentType:  "application/json",
 		Body:         body,
-		Headers:      amqp.Table{"message_id": messageID},
+		Headers:      headers,
 	}); err != nil {
 		return fmt.Errorf("publish: %w", err)
 	}

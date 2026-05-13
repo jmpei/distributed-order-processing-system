@@ -5,13 +5,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
 	"math/rand"
 
 	amqp "github.com/rabbitmq/amqp091-go"
+	"go.uber.org/zap"
 	"gorm.io/gorm"
 
 	shared "github.com/TomatoesSuck/distributed-order-processing/shared"
+	"github.com/TomatoesSuck/distributed-order-processing/shared/observability"
 
 	"github.com/TomatoesSuck/distributed-order-processing/payment-service/internal/messaging"
 	"github.com/TomatoesSuck/distributed-order-processing/payment-service/internal/model"
@@ -48,7 +49,8 @@ func (h *PaymentCommandHandler) Handle(ctx context.Context, msg amqp.Delivery) e
 		}
 		return h.handleProcess(ctx, cmd, msg.MessageId)
 	default:
-		log.Printf("payment: unknown routing key %s, skipping", msg.RoutingKey)
+		observability.LoggerFrom(ctx).Warn("payment: unknown routing key, skipping",
+			zap.String("routing_key", msg.RoutingKey))
 		return nil
 	}
 }
@@ -59,8 +61,9 @@ func (h *PaymentCommandHandler) handleProcess(ctx context.Context, cmd shared.Pr
 	if err != nil {
 		return fmt.Errorf("check processed_events: %w", err)
 	}
+	logger := observability.LoggerFrom(ctx)
 	if done {
-		log.Printf("payment: cmd already processed (msg_id=%s), skipping", msgID)
+		logger.Info("cmd already processed, skipping", zap.String("msg_id", msgID))
 		return nil
 	}
 
@@ -82,7 +85,9 @@ func (h *PaymentCommandHandler) handleProcess(ctx context.Context, cmd shared.Pr
 		if !success {
 			reason = "SIMULATED_FAILURE"
 		}
-		log.Printf("payment: payment row exists for order %d status=%s (idempotent)", cmd.OrderID, existing.Status)
+		logger.Info("payment row exists (idempotent)",
+			zap.Uint64("order_id", cmd.OrderID),
+			zap.String("status", existing.Status))
 	} else {
 		// Simulate failure if configured
 		failed := h.failureRate > 0 && rand.Float64() < h.failureRate
@@ -102,7 +107,10 @@ func (h *PaymentCommandHandler) handleProcess(ctx context.Context, cmd shared.Pr
 			return fmt.Errorf("payment transaction: %w", err)
 		}
 		success = !failed
-		log.Printf("payment: processed order %d tx_id=%s status=%s", cmd.OrderID, txID, status)
+		logger.Info("processed",
+			zap.Uint64("order_id", cmd.OrderID),
+			zap.String("tx_id", txID),
+			zap.String("status", status))
 	}
 
 	event := shared.PaymentProcessedEvent{

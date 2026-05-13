@@ -5,11 +5,12 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"fmt"
-	"log"
 
 	amqp "github.com/rabbitmq/amqp091-go"
+	"go.uber.org/zap"
 
 	shared "github.com/TomatoesSuck/distributed-order-processing/shared"
+	"github.com/TomatoesSuck/distributed-order-processing/shared/observability"
 
 	"github.com/TomatoesSuck/distributed-order-processing/inventory-service/internal/messaging"
 	"github.com/TomatoesSuck/distributed-order-processing/inventory-service/internal/repository"
@@ -51,7 +52,8 @@ func (h *InventoryCommandHandler) Handle(ctx context.Context, msg amqp.Delivery)
 		}
 		return h.handleRelease(ctx, cmd)
 	default:
-		log.Printf("inventory: unknown routing key %s, skipping", msg.RoutingKey)
+		observability.LoggerFrom(ctx).Warn("inventory: unknown routing key, skipping",
+			zap.String("routing_key", msg.RoutingKey))
 		return nil
 	}
 }
@@ -62,8 +64,9 @@ func (h *InventoryCommandHandler) handleReserve(ctx context.Context, cmd shared.
 	if err != nil {
 		return fmt.Errorf("check inventory_log: %w", err)
 	}
+	logger := observability.LoggerFrom(ctx)
 	if exists {
-		log.Printf("inventory: reserve already done for order %d (idempotent)", cmd.OrderID)
+		logger.Info("reserve already done (idempotent)", zap.Uint64("order_id", cmd.OrderID))
 		return h.publishReserved(ctx, cmd, true, "")
 	}
 
@@ -73,8 +76,10 @@ func (h *InventoryCommandHandler) handleReserve(ctx context.Context, cmd shared.
 			return fmt.Errorf("get inventory: %w", err)
 		}
 		if inv.AvailableQty < cmd.Quantity {
-			log.Printf("inventory: insufficient stock product=%d available=%d requested=%d",
-				cmd.ProductID, inv.AvailableQty, cmd.Quantity)
+			logger.Info("insufficient stock",
+				zap.Uint64("product_id", cmd.ProductID),
+				zap.Int("available", inv.AvailableQty),
+				zap.Int("requested", cmd.Quantity))
 			return h.publishReserved(ctx, cmd, false, "INSUFFICIENT_STOCK")
 		}
 
@@ -83,18 +88,24 @@ func (h *InventoryCommandHandler) handleReserve(ctx context.Context, cmd shared.
 			return fmt.Errorf("reserve atomic: %w", err)
 		}
 		if rowsAffected > 0 {
-			log.Printf("inventory: reserved %d units of product %d for order %d (attempt %d)",
-				cmd.Quantity, cmd.ProductID, cmd.OrderID, attempt+1)
+			logger.Info("reserved",
+				zap.Int("quantity", cmd.Quantity),
+				zap.Uint64("product_id", cmd.ProductID),
+				zap.Uint64("order_id", cmd.OrderID),
+				zap.Int("attempt", attempt+1))
 			return h.publishReserved(ctx, cmd, true, "")
 		}
-		log.Printf("inventory: version conflict product=%d attempt=%d/%d, retrying",
-			cmd.ProductID, attempt+1, h.reserveMaxRetries)
+		logger.Debug("version conflict, retrying",
+			zap.Uint64("product_id", cmd.ProductID),
+			zap.Int("attempt", attempt+1),
+			zap.Int("max", h.reserveMaxRetries))
 	}
 
 	// All retries exhausted under contention; surface as insufficient stock to avoid
 	// infinite republish loops. Bump INVENTORY_RESERVE_MAX_RETRIES if this fires.
-	log.Printf("inventory: optimistic lock failed after %d retries for product %d, treating as insufficient stock",
-		h.reserveMaxRetries, cmd.ProductID)
+	logger.Warn("optimistic lock failed after all retries, treating as insufficient stock",
+		zap.Int("retries", h.reserveMaxRetries),
+		zap.Uint64("product_id", cmd.ProductID))
 	return h.publishReserved(ctx, cmd, false, "INSUFFICIENT_STOCK")
 }
 
@@ -104,24 +115,27 @@ func (h *InventoryCommandHandler) handleRelease(ctx context.Context, cmd shared.
 	if err != nil {
 		return fmt.Errorf("check inventory_log: %w", err)
 	}
+	logger := observability.LoggerFrom(ctx)
 	if exists {
-		log.Printf("inventory: release already done for order %d (idempotent)", cmd.OrderID)
+		logger.Info("release already done (idempotent)", zap.Uint64("order_id", cmd.OrderID))
 		return h.publishReleased(ctx, cmd, true, "")
 	}
 
 	rowsAffected, err := h.invRepo.ReleaseAtomic(ctx, cmd.ProductID, cmd.OrderID, cmd.Quantity)
 	if err != nil {
-		log.Printf("inventory: release transaction failed order=%d: %v", cmd.OrderID, err)
+		logger.Error("release transaction failed", zap.Uint64("order_id", cmd.OrderID), zap.Error(err))
 		return h.publishReleased(ctx, cmd, false, err.Error())
 	}
 	if rowsAffected == 0 {
 		err := fmt.Errorf("product %d not found", cmd.ProductID)
-		log.Printf("inventory: release failed order=%d: %v", cmd.OrderID, err)
+		logger.Error("release failed", zap.Uint64("order_id", cmd.OrderID), zap.Error(err))
 		return h.publishReleased(ctx, cmd, false, err.Error())
 	}
 
-	log.Printf("inventory: released %d units of product %d for order %d",
-		cmd.Quantity, cmd.ProductID, cmd.OrderID)
+	logger.Info("released",
+		zap.Int("quantity", cmd.Quantity),
+		zap.Uint64("product_id", cmd.ProductID),
+		zap.Uint64("order_id", cmd.OrderID))
 	return h.publishReleased(ctx, cmd, true, "")
 }
 
