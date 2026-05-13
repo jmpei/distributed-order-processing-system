@@ -25,9 +25,12 @@ if [[ ! -f "$TF_DIR/terraform.tfvars" ]]; then
   exit 1
 fi
 
-if ! command -v mysql >/dev/null 2>&1; then
-  echo "✗ 'mysql' CLI not found. Install with: brew install mysql-client"
-  echo "  (and follow the brew caveats to add it to PATH)"
+if ! command -v docker >/dev/null 2>&1; then
+  echo "✗ docker not found. Stage 2 runs mysql:8 in a container to talk to RDS."
+  exit 1
+fi
+if ! docker info >/dev/null 2>&1; then
+  echo "✗ Docker daemon not running. Start Docker Desktop and retry."
   exit 1
 fi
 
@@ -45,20 +48,27 @@ terraform apply -input=false -auto-approve \
 
 DB_HOST=$(terraform output -raw rds_endpoint)
 DB_PORT=$(terraform output -raw rds_port)
-DB_USER=$(terraform output -raw db_master_username)
+# db_master_username output only references var.db_master_username; a partial
+# apply with -target won't materialise it in state. Evaluate the var directly.
+DB_USER=$(echo 'var.db_master_username' | terraform console | tr -d '"')
 DB_PASS=$(terraform output -raw db_master_password)
 
 echo
 echo "▶ Stage 2/3: creating inventory_db and payments_db schemas"
 # orders_db is created by RDS as the initial DB. The other two we add now.
-MYSQL_PWD="$DB_PASS" mysql \
-  --host="$DB_HOST" \
-  --port="$DB_PORT" \
-  --user="$DB_USER" \
-  --connect-timeout=10 \
-  -e "CREATE DATABASE IF NOT EXISTS inventory_db CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
-      CREATE DATABASE IF NOT EXISTS payments_db CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
-      SHOW DATABASES;"
+# Use mysql:8 in a container — Homebrew's mysql 9.x dropped the
+# mysql_native_password plugin that RDS 8.0 still uses for the master user.
+docker run --rm \
+  -e MYSQL_PWD="$DB_PASS" \
+  mysql:8 \
+  mysql \
+    --host="$DB_HOST" \
+    --port="$DB_PORT" \
+    --user="$DB_USER" \
+    --connect-timeout=10 \
+    -e "CREATE DATABASE IF NOT EXISTS inventory_db CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
+        CREATE DATABASE IF NOT EXISTS payments_db CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
+        SHOW DATABASES;"
 
 echo
 echo "▶ Stage 3/3: apply remaining resources (MQ + ALB + ECS — ~10 min for MQ broker)"

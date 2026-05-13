@@ -60,7 +60,7 @@ variable "db_master_username" {
 variable "mq_instance_type" {
   description = "AWS MQ broker instance type"
   type        = string
-  default     = "mq.t3.micro"
+  default     = "mq.m7g.medium"
 }
 
 variable "mq_engine_version" {

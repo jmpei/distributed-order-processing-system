@@ -39,4 +39,14 @@ resource "aws_db_instance" "this" {
   monitoring_interval          = 0
 
   tags = { Name = "${local.name_prefix}-mysql" }
+
+  # publicly_accessible=true requires the VPC to have an IGW attached AND
+  # the subnets in the subnet group to route 0.0.0.0/0 to it. Without these
+  # transitive deps, `terraform apply -target=aws_db_instance.this` can
+  # create RDS before the IGW + public route table association exist, and
+  # external clients (e.g. deploy.sh stage 2) can't reach the instance.
+  depends_on = [
+    aws_internet_gateway.this,
+    aws_route_table_association.public,
+  ]
 }
