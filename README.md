@@ -453,3 +453,5 @@ bash deploy/scripts/destroy.sh
 - **Saga state persisted** in `saga_states` (`current_step` + `status`), updated atomically with the side-effect inside one DB transaction so the orchestrator never disagrees with itself across crashes.
 - **Compensation** is an explicit saga branch, not error handling: payment failure transitions saga to `COMPENSATING` and emits `inventory.release`; only after the released event lands does the saga become terminal.
 - **Recovery via re-publish**: `RecoverInProgressSagas` periodically re-sends the current step's command. Idempotency at consumers makes re-sends free.
+
+See [`docs/design/throughput-and-redis.md`](docs/design/throughput-and-redis.md) for the throughput / Redis discussion (measured 1,884 req/s, why MySQL is enough here, when Redis would actually matter).
