@@ -5,6 +5,8 @@ import (
 	"log"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/collectors"
 	"gorm.io/driver/mysql"
 	"gorm.io/gorm"
 
@@ -24,9 +26,14 @@ func Connect(cfg config.Config) (*gorm.DB, error) {
 			if e != nil {
 				return nil, fmt.Errorf("get sql.DB: %w", e)
 			}
-			sqlDB.SetMaxOpenConns(25)
-			sqlDB.SetMaxIdleConns(5)
-			sqlDB.SetConnMaxLifetime(5 * time.Minute)
+			sqlDB.SetMaxOpenConns(cfg.DBMaxOpenConns)
+			sqlDB.SetMaxIdleConns(cfg.DBMaxIdleConns)
+			sqlDB.SetConnMaxLifetime(time.Duration(cfg.DBConnMaxLifetimeMin) * time.Minute)
+			// Expose go_sql_stats_* (in_use, idle, wait_count, wait_duration, …)
+			// so Prometheus can show pool saturation during load tests.
+			prometheus.DefaultRegisterer.MustRegister(
+				collectors.NewDBStatsCollector(sqlDB, "order"),
+			)
 			return db, nil
 		}
 		lastErr = err

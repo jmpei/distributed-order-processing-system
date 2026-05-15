@@ -57,6 +57,24 @@ variable "db_master_username" {
   default     = "admin"
 }
 
+variable "db_max_open_conns" {
+  description = "Per-service MySQL driver max open connections (sql.DB.SetMaxOpenConns). Total across N service tasks must stay under RDS max_connections — db.t4g.micro defaults to ~60."
+  type        = number
+  default     = 25
+}
+
+variable "db_max_idle_conns" {
+  description = "Per-service MySQL driver max idle connections (sql.DB.SetMaxIdleConns)."
+  type        = number
+  default     = 5
+}
+
+variable "db_conn_max_lifetime_min" {
+  description = "Per-service MySQL driver connection max lifetime in minutes (sql.DB.SetConnMaxLifetime)."
+  type        = number
+  default     = 5
+}
+
 variable "mq_instance_type" {
   description = "AWS MQ broker instance type"
   type        = string

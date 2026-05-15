@@ -29,6 +29,9 @@ locals {
   common_env = [
     { name = "DB_HOST", value = aws_db_instance.this.address },
     { name = "DB_PORT", value = tostring(aws_db_instance.this.port) },
+    { name = "DB_MAX_OPEN_CONNS", value = tostring(var.db_max_open_conns) },
+    { name = "DB_MAX_IDLE_CONNS", value = tostring(var.db_max_idle_conns) },
+    { name = "DB_CONN_MAX_LIFETIME_MIN", value = tostring(var.db_conn_max_lifetime_min) },
   ]
 
   # Common secrets: DB creds (extracted via JSON key) + full amqps URL.
