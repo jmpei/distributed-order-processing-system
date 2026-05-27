@@ -128,6 +128,21 @@ curl -X POST http://localhost:8081/orders \
   -d '{"user_id": 42, "product_id": 1001, "quantity": 2, "total_amount": 199.98}'
 ```
 
+### Watch the end-to-end demo
+
+A single script walks the saga through both its terminal branches in ~40 seconds, with colour-coded narration — no manual `curl`:
+
+```bash
+bash scripts/demo.sh
+```
+
+| Phase | What you see |
+|---|---|
+| Happy path | Seed product `9001` → `POST /orders` → wait 5 s → assert order `CONFIRMED`, inventory `10 → 8`, payment `SUCCESS` |
+| Compensation | Restart `payment-service` with `PAYMENT_FAILURE_RATE=1.0` → seed `9002` → `POST /orders` → wait 5 s → assert order `COMPENSATED`, inventory `10 → 10` (refunded) |
+
+While it runs, open the [Saga Overview dashboard](http://localhost:3000/d/dop-saga-overview/saga-overview) to watch the saga counters and latency percentiles update live, or the [RabbitMQ UI](http://localhost:15672) (guest/guest) to see messages flowing across `saga.commands` / `saga.events`. A bash `trap` restores `PAYMENT_FAILURE_RATE=0.0` on exit, so re-running the script (or ^C-ing it) leaves the stack in a clean state.
+
 **Run the test scripts** (each prints `PASS` or `FAIL` and exits non-zero on failure):
 
 | Script | What it verifies |
