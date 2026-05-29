@@ -103,3 +103,19 @@ func TestDispatch_RepublishFails_NacksToBroker(t *testing.T) {
 	assert.True(t, ack.nackRequeue)
 	assert.False(t, ack.acked)
 }
+
+// TestDispatch_DLQRepublishFails_NacksWithoutRequeue covers the dead-letter
+// branch's fallback: when republishing to the DLQ fails, the message is
+// Nack'd with requeue=false so the broker's own DLX handles it. The requeue
+// flag here is the opposite of the retry path's, so it is verified explicitly.
+func TestDispatch_DLQRepublishFails_NacksWithoutRequeue(t *testing.T) {
+	ack := &fakeAck{}
+	rep := &mockRepublisher{err: errors.New("broker down")}
+	dispatchMsg(context.Background(),
+		newDelivery("inventory.reserve", amqp.Table{amqpretry.HeaderRetryCount: int32(5)}, ack),
+		zap.NewNop(), rep, "inventory.commands", 5,
+		func(ctx context.Context, m amqp.Delivery) error { return errors.New("db blip") })
+	assert.True(t, ack.nacked)
+	assert.False(t, ack.nackRequeue)
+	assert.False(t, ack.acked)
+}
