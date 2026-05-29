@@ -469,4 +469,8 @@ bash deploy/scripts/destroy.sh
 - **Compensation** is an explicit saga branch, not error handling: payment failure transitions saga to `COMPENSATING` and emits `inventory.release`; only after the released event lands does the saga become terminal.
 - **Recovery via re-publish**: `RecoverInProgressSagas` periodically re-sends the current step's command. Idempotency at consumers makes re-sends free.
 
-See [`docs/design/throughput-and-redis.md`](docs/design/throughput-and-redis.md) for the throughput / Redis discussion (measured 1,884 req/s, why MySQL is enough here, when Redis would actually matter).
+### Design notes
+
+- [`docs/design/throughput-and-redis.md`](docs/design/throughput-and-redis.md) — the throughput / Redis discussion (measured 1,884 req/s, why MySQL is enough here, when Redis would actually matter).
+- [`docs/design/outbox-and-dual-write.md`](docs/design/outbox-and-dual-write.md) — the DB-commit-then-publish dual-write gap, why the recovery loop + idempotency bound it, and when a transactional outbox would be worth it.
+- [`docs/design/publisher-channel-reuse.md`](docs/design/publisher-channel-reuse.md) — an AMQP channel-reuse optimization that load testing rejected (it serialized concurrent publishes, ~2.5–4× throughput regression) and the revert.
