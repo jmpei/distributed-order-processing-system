@@ -17,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	amqp "github.com/rabbitmq/amqp091-go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -192,6 +193,48 @@ func TestE2E_ConcurrentOrders_NoOversell(t *testing.T) {
 	assert.LessOrEqual(t, confirmed, stockQty, "should never confirm more than stock")
 	assert.Equal(t, stockQty, confirmed, "expected exactly %d confirmed orders", stockQty)
 	assert.Equal(t, concurrentOrders-stockQty, failed, "expected %d failed orders", concurrentOrders-stockQty)
+}
+
+// ─── TestE2E_RetryTopologyDeclared_HappyPathCompletes ───────────────────────
+
+// Asserts the delayed-retry topology is actually declared on the broker by the
+// services at startup (the <queue>.retry queues), and that a normal order still
+// completes end-to-end with that topology in place — i.e. the retry plumbing is
+// wired and non-regressive.
+func TestE2E_RetryTopologyDeclared_HappyPathCompletes(t *testing.T) {
+	infra := setupInfra(t)
+	infra.resetSchemas(t)
+
+	orderSvc, _, _ := infra.startAllServices(t, 0.0)
+
+	// Each retry queue must exist. A passive declare fails (and closes the
+	// channel) if the queue is absent, so use a fresh channel per check.
+	conn, err := amqp.Dial(infra.amqpURL)
+	require.NoError(t, err)
+	defer conn.Close()
+	for _, q := range []string{"inventory.commands.retry", "payment.commands.retry", "order.events.retry"} {
+		ch, err := conn.Channel()
+		require.NoError(t, err)
+		_, err = ch.QueueDeclarePassive(q, true, false, false, false, nil)
+		require.NoError(t, err, "retry queue %s must be declared by its service at startup", q)
+		_ = ch.Close()
+	}
+
+	const productID = 8003
+	const initialQty = 10
+	const orderQty = 2
+	seedInventory(t, infra, productID, initialQty)
+
+	orderID := postOrder(t, orderSvc.port, productID, orderQty, 199.98)
+
+	require.Eventually(t, func() bool {
+		return getOrderStatus(t, orderSvc.port, orderID) == "CONFIRMED"
+	}, 30*time.Second, 200*time.Millisecond, "happy-path order never reached CONFIRMED")
+
+	avail, reserved := getInventory(t, infra, productID)
+	assert.Equal(t, initialQty-orderQty, avail, "available_qty should be decremented by the order qty")
+	assert.Equal(t, orderQty, reserved, "reserved_qty should equal the order qty")
+	assert.Equal(t, "COMPLETED", getSagaStatusForOrder(t, infra, orderID), "saga_state should be COMPLETED")
 }
 
 // ─── helpers used by the tests above ───────────────────────────────────────
