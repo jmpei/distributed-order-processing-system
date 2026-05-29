@@ -79,6 +79,9 @@ func (p *Publisher) publishLocked(ctx context.Context, exchange, routingKey, mes
 		p.drop()
 		return fmt.Errorf("publisher confirm timeout")
 	case <-ctx.Done():
+		// The publish may already be in flight; drop the channel so a late
+		// broker ack can't be mistaken for the next publish's confirmation.
+		p.drop()
 		return ctx.Err()
 	}
 }
