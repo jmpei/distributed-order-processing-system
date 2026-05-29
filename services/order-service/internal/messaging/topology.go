@@ -6,6 +6,7 @@ import (
 	amqp "github.com/rabbitmq/amqp091-go"
 
 	shared "github.com/TomatoesSuck/distributed-order-processing/shared"
+	"github.com/TomatoesSuck/distributed-order-processing/shared/amqpretry"
 )
 
 // Setup declares all exchanges and the queues this service consumes from.
@@ -40,6 +41,26 @@ func Setup(mq *MQ) error {
 	}
 	if err := ch.QueueBind(shared.QueueOrderEvents, "#", shared.ExchangeEvents, false, nil); err != nil {
 		return fmt.Errorf("bind %s: %w", shared.QueueOrderEvents, err)
+	}
+
+	// Retry exchange (shared by all services; idempotent).
+	if err := ch.ExchangeDeclare(amqpretry.RetryExchange, "direct", true, false, false, false, nil); err != nil {
+		return fmt.Errorf("declare retry exchange: %w", err)
+	}
+	// order.events.retry: hold for RetryTTLMillis, then dead-letter back
+	// to saga.events under the message's ORIGINAL routing key (no
+	// x-dead-letter-routing-key set, so the original key is preserved).
+	retryArgs := amqp.Table{
+		"x-message-ttl":          int32(amqpretry.RetryTTLMillis),
+		"x-dead-letter-exchange": shared.ExchangeEvents,
+	}
+	if _, err := ch.QueueDeclare(shared.QueueOrderEvents+".retry", true, false, false, false, retryArgs); err != nil {
+		return fmt.Errorf("declare retry queue: %w", err)
+	}
+	for _, key := range []string{shared.RoutingKeyInventoryReserved, shared.RoutingKeyInventoryReleased, shared.RoutingKeyPaymentProcessed} {
+		if err := ch.QueueBind(shared.QueueOrderEvents+".retry", key, amqpretry.RetryExchange, false, nil); err != nil {
+			return fmt.Errorf("bind retry %s: %w", key, err)
+		}
 	}
 
 	return nil
