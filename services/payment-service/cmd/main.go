@@ -73,7 +73,7 @@ func main() {
 	consumerCtx, stopConsumers := context.WithCancel(context.Background())
 	defer stopConsumers()
 
-	if err := messaging.StartConsumer(consumerCtx, mq, shared.QueuePaymentCommands, logger, cmdHandler.Handle); err != nil {
+	if err := messaging.StartConsumer(consumerCtx, mq, shared.QueuePaymentCommands, logger, cmdHandler.Handle, pub, cfg.RetryMaxAttempts); err != nil {
 		logger.Fatal("start consumer", zap.Error(err))
 	}
 	logger.Info("consumer started", zap.String("queue", shared.QueuePaymentCommands))

@@ -18,6 +18,7 @@ type Config struct {
 	DBConnMaxLifetimeMin int
 	RabbitMQURL          string
 	ReserveMaxRetries    int
+	RetryMaxAttempts     int
 }
 
 func Load() Config {
@@ -33,6 +34,7 @@ func Load() Config {
 		DBConnMaxLifetimeMin: getEnvInt("DB_CONN_MAX_LIFETIME_MIN", 5),
 		RabbitMQURL:          getEnv("RABBITMQ_URL", "amqp://guest:guest@localhost:5672/"),
 		ReserveMaxRetries:    getEnvInt("INVENTORY_RESERVE_MAX_RETRIES", 50),
+		RetryMaxAttempts:     getEnvInt("RETRY_MAX_ATTEMPTS", 5),
 	}
 }
 

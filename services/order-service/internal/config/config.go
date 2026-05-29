@@ -17,6 +17,7 @@ type Config struct {
 	DBMaxIdleConns       int
 	DBConnMaxLifetimeMin int
 	RabbitMQURL          string
+	RetryMaxAttempts     int
 }
 
 func Load() Config {
@@ -31,6 +32,7 @@ func Load() Config {
 		DBMaxIdleConns:       getEnvInt("DB_MAX_IDLE_CONNS", 5),
 		DBConnMaxLifetimeMin: getEnvInt("DB_CONN_MAX_LIFETIME_MIN", 5),
 		RabbitMQURL:          getEnv("RABBITMQ_URL", "amqp://guest:guest@localhost:5672/"),
+		RetryMaxAttempts:     getEnvInt("RETRY_MAX_ATTEMPTS", 5),
 	}
 }
 
