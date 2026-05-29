@@ -8,10 +8,17 @@ import (
 	amqp "github.com/rabbitmq/amqp091-go"
 	"go.uber.org/zap"
 
+	"github.com/TomatoesSuck/distributed-order-processing/shared/amqpretry"
 	"github.com/TomatoesSuck/distributed-order-processing/shared/observability"
 )
 
 type HandlerFunc func(ctx context.Context, msg amqp.Delivery) error
+
+// Republisher forwards a failed delivery to the retry queue or DLQ.
+// Satisfied by *Publisher.
+type Republisher interface {
+	PublishRaw(ctx context.Context, exchange, routingKey, messageID string, body []byte, headers amqp.Table) error
+}
 
 // Consumer tunables — kept identical across all three services so capacity
 // reasoning ("3 × consumerWorkers concurrent handlers DB-side") stays simple.
@@ -30,7 +37,7 @@ const (
 // `logger` is the per-service base logger; trace_id and saga_id pulled from
 // the AMQP headers are bound to it before each message is dispatched, so
 // `observability.LoggerFrom(ctx)` inside the handler emits them automatically.
-func StartConsumer(ctx context.Context, mq *MQ, queue string, logger *zap.Logger, handler HandlerFunc) error {
+func StartConsumer(ctx context.Context, mq *MQ, queue string, logger *zap.Logger, handler HandlerFunc, rep Republisher, maxRetries int) error {
 	if logger == nil {
 		logger = zap.NewNop()
 	}
@@ -48,7 +55,7 @@ func StartConsumer(ctx context.Context, mq *MQ, queue string, logger *zap.Logger
 	for i := 0; i < consumerWorkers; i++ {
 		go func() {
 			for msg := range work {
-				dispatchMsg(ctx, msg, logger, handler)
+				dispatchMsg(ctx, msg, logger, rep, queue, maxRetries, handler)
 			}
 		}()
 	}
@@ -85,30 +92,63 @@ func StartConsumer(ctx context.Context, mq *MQ, queue string, logger *zap.Logger
 	return nil
 }
 
-func dispatchMsg(parent context.Context, msg amqp.Delivery, logger *zap.Logger, handler HandlerFunc) {
+func dispatchMsg(parent context.Context, msg amqp.Delivery, logger *zap.Logger, rep Republisher, queue string, maxRetries int, handler HandlerFunc) {
 	defer func() {
 		if r := recover(); r != nil {
-			logger.Error("panic in consumer handler, nacking",
-				zap.Any("panic", r),
-				zap.String("routing_key", msg.RoutingKey),
-			)
-			_ = msg.Nack(false, false)
+			logger.Error("panic in consumer handler, dead-lettering via broker",
+				zap.Any("panic", r), zap.String("routing_key", msg.RoutingKey))
+			_ = msg.Nack(false, false) // broker DLX → <queue>.dlq
 		}
 	}()
 
-	// Seed ctx with trace_id + saga_id from message headers so the handler's
-	// LoggerFrom(ctx) emits them, and any downstream publish carries them on.
 	ctx := observability.ExtractAMQPHeaders(parent, logger, msg.Headers)
+	log := observability.LoggerFrom(ctx)
 
-	if err := handler(ctx, msg); err != nil {
-		observability.LoggerFrom(ctx).Error("handler error, nacking",
-			zap.String("routing_key", msg.RoutingKey),
-			zap.Error(err),
-		)
-		_ = msg.Nack(false, false)
+	err := handler(ctx, msg)
+	if err == nil {
+		_ = msg.Ack(false)
 		return
 	}
-	_ = msg.Ack(false)
+
+	retryCount := amqpretry.RetryCount(msg.Headers)
+	switch amqpretry.Decide(err, retryCount, maxRetries) {
+	case amqpretry.ActionRetry:
+		headers := cloneHeaders(msg.Headers)
+		headers[amqpretry.HeaderRetryCount] = int32(retryCount + 1)
+		log.Warn("handler error, scheduling retry",
+			zap.String("routing_key", msg.RoutingKey),
+			zap.Int("retry_count", retryCount+1),
+			zap.Int("max", maxRetries),
+			zap.Error(err))
+		if perr := rep.PublishRaw(ctx, amqpretry.RetryExchange, msg.RoutingKey, msg.MessageId, msg.Body, headers); perr != nil {
+			log.Error("republish to retry failed, nacking for broker redelivery", zap.Error(perr))
+			_ = msg.Nack(false, true)
+			return
+		}
+		_ = msg.Ack(false)
+	default: // ActionDeadLetter
+		log.Error("handler error, dead-lettering",
+			zap.String("routing_key", msg.RoutingKey),
+			zap.Int("retry_count", retryCount),
+			zap.Bool("permanent", amqpretry.IsPermanent(err)),
+			zap.Error(err))
+		if perr := rep.PublishRaw(ctx, "", queue+".dlq", msg.MessageId, msg.Body, msg.Headers); perr != nil {
+			log.Error("republish to dlq failed, nacking to broker dlx", zap.Error(perr))
+			_ = msg.Nack(false, false)
+			return
+		}
+		_ = msg.Ack(false)
+	}
+}
+
+// cloneHeaders copies an amqp.Table so mutating the retry count never touches
+// the original delivery's headers. Returns a fresh empty table for nil input.
+func cloneHeaders(h amqp.Table) amqp.Table {
+	out := amqp.Table{}
+	for k, v := range h {
+		out[k] = v
+	}
+	return out
 }
 
 func openConsumerCh(mq *MQ, queue string) (*amqp.Channel, <-chan amqp.Delivery, error) {
