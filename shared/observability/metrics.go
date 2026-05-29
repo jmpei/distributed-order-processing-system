@@ -47,4 +47,14 @@ var (
 		},
 		[]string{"status"},
 	)
+
+	// DLQMessages is the current message count in each dead-letter queue,
+	// sampled periodically by each service's StartDLQSampler.
+	DLQMessages = promauto.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "dlq_messages",
+			Help: "Current message count in each dead-letter queue.",
+		},
+		[]string{"queue"},
+	)
 )
