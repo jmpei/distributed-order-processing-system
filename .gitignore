@@ -29,3 +29,6 @@ deploy/terraform/crash.log
 
 # Personal learning notes / scratch space — never committed
 learner/
+
+# AI working artifacts (brainstorm specs, plans, benchmark notes) — never committed
+specs/
