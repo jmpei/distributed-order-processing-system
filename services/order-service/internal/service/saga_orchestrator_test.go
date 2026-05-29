@@ -245,6 +245,106 @@ func TestOnInventoryReleased_Success(t *testing.T) {
 	pub.AssertNotCalled(t, "Publish")
 }
 
+// TestRecoverInProgress_ReservingInventory covers recoverInProgress re-publishing a
+// ReserveInventoryCmd for a saga stuck at RESERVING_INVENTORY.
+func TestRecoverInProgress_ReservingInventory(t *testing.T) {
+	sagaRepo := &mockSagaRepo{}
+	orderRepo := &mockOrderRepo{}
+	pub := &mockPublisher{}
+
+	s := model.SagaState{SagaID: "saga-r1", OrderID: 1, CurrentStep: model.SagaStepReservingInventory, Status: model.SagaStatusInProgress}
+	orderRepo.On("GetByID", mock.Anything, uint64(1)).
+		Return(&model.Order{BaseModel: model.BaseModel{ID: 1}, ProductID: 1001, Quantity: 2, TotalAmount: 100}, nil).Once()
+	pub.On("Publish", mock.Anything, shared.ExchangeCommands, shared.RoutingKeyInventoryReserve,
+		mock.Anything, mock.MatchedBy(func(p any) bool {
+			c, ok := p.(shared.ReserveInventoryCmd)
+			return ok && c.SagaID == "saga-r1" && c.OrderID == 1 && c.ProductID == 1001 && c.Quantity == 2
+		})).Return(nil).Once()
+
+	o := NewSagaOrchestrator(sagaRepo, orderRepo, pub, nil)
+	assert.NoError(t, o.recoverInProgress(context.Background(), s))
+	orderRepo.AssertExpectations(t)
+	pub.AssertExpectations(t)
+}
+
+// TestRecoverInProgress_ProcessingPayment covers recoverInProgress re-publishing a
+// ProcessPaymentCmd for a saga stuck at PROCESSING_PAYMENT.
+func TestRecoverInProgress_ProcessingPayment(t *testing.T) {
+	sagaRepo := &mockSagaRepo{}
+	orderRepo := &mockOrderRepo{}
+	pub := &mockPublisher{}
+
+	s := model.SagaState{SagaID: "saga-r2", OrderID: 2, CurrentStep: model.SagaStepProcessingPayment, Status: model.SagaStatusInProgress}
+	orderRepo.On("GetByID", mock.Anything, uint64(2)).
+		Return(&model.Order{BaseModel: model.BaseModel{ID: 2}, ProductID: 1001, Quantity: 1, TotalAmount: 50}, nil).Once()
+	pub.On("Publish", mock.Anything, shared.ExchangeCommands, shared.RoutingKeyPaymentProcess,
+		mock.Anything, mock.MatchedBy(func(p any) bool {
+			c, ok := p.(shared.ProcessPaymentCmd)
+			return ok && c.SagaID == "saga-r2" && c.OrderID == 2 && c.Amount == 50
+		})).Return(nil).Once()
+
+	o := NewSagaOrchestrator(sagaRepo, orderRepo, pub, nil)
+	assert.NoError(t, o.recoverInProgress(context.Background(), s))
+	orderRepo.AssertExpectations(t)
+	pub.AssertExpectations(t)
+}
+
+// TestRecoverCompensating_ReleasingInventory covers recoverCompensating re-publishing a
+// ReleaseInventoryCmd for a saga stuck at RELEASING_INVENTORY.
+func TestRecoverCompensating_ReleasingInventory(t *testing.T) {
+	sagaRepo := &mockSagaRepo{}
+	orderRepo := &mockOrderRepo{}
+	pub := &mockPublisher{}
+
+	s := model.SagaState{SagaID: "saga-r3", OrderID: 3, CurrentStep: model.SagaStepReleasingInventory, Status: model.SagaStatusCompensating}
+	orderRepo.On("GetByID", mock.Anything, uint64(3)).
+		Return(&model.Order{BaseModel: model.BaseModel{ID: 3}, ProductID: 1002, Quantity: 3, TotalAmount: 150}, nil).Once()
+	pub.On("Publish", mock.Anything, shared.ExchangeCommands, shared.RoutingKeyInventoryRelease,
+		mock.Anything, mock.MatchedBy(func(p any) bool {
+			c, ok := p.(shared.ReleaseInventoryCmd)
+			return ok && c.SagaID == "saga-r3" && c.OrderID == 3 && c.ProductID == 1002 && c.Quantity == 3
+		})).Return(nil).Once()
+
+	o := NewSagaOrchestrator(sagaRepo, orderRepo, pub, nil)
+	assert.NoError(t, o.recoverCompensating(context.Background(), s))
+	orderRepo.AssertExpectations(t)
+	pub.AssertExpectations(t)
+}
+
+// TestRecoverCompensating_UnexpectedStep covers recoverCompensating SKIPPING a saga whose
+// step is not RELEASING_INVENTORY: it must not look up the order nor publish anything.
+func TestRecoverCompensating_UnexpectedStep(t *testing.T) {
+	sagaRepo := &mockSagaRepo{}
+	orderRepo := &mockOrderRepo{}
+	pub := &mockPublisher{}
+
+	// COMPENSATING but still at PROCESSING_PAYMENT — an unexpected step for compensation.
+	s := model.SagaState{SagaID: "saga-r4", OrderID: 4, CurrentStep: model.SagaStepProcessingPayment, Status: model.SagaStatusCompensating}
+
+	o := NewSagaOrchestrator(sagaRepo, orderRepo, pub, nil)
+	assert.NoError(t, o.recoverCompensating(context.Background(), s))
+	orderRepo.AssertNotCalled(t, "GetByID")
+	pub.AssertNotCalled(t, "Publish")
+}
+
+// TestOnInventoryReleased_Failed covers the FAILED terminal branch: when the repo reports
+// Failed==true (compensation itself failed) the saga is recorded terminal-FAILED with no panic
+// and no further publish.
+func TestOnInventoryReleased_Failed(t *testing.T) {
+	sagaRepo := &mockSagaRepo{}
+	orderRepo := &mockOrderRepo{}
+	pub := &mockPublisher{}
+
+	event := shared.InventoryReleasedEvent{SagaID: "saga-f1", OrderID: 11, Success: false, Reason: "RELEASE_FAILED"}
+	sagaRepo.On("CommitInventoryReleased", mock.Anything, "evt-f1", event).
+		Return(repository.InventoryReleasedOutcome{Failed: true, Duration: time.Second}, nil).Once()
+
+	o := NewSagaOrchestrator(sagaRepo, orderRepo, pub, nil)
+	assert.NoError(t, o.onInventoryReleased(context.Background(), event, "evt-f1"))
+	sagaRepo.AssertExpectations(t)
+	pub.AssertNotCalled(t, "Publish")
+}
+
 // TestHandleEvent_DispatchRouting covers the consumer entry point's routing-key switch.
 func TestHandleEvent_DispatchRouting(t *testing.T) {
 	sagaRepo := &mockSagaRepo{}
