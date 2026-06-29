@@ -49,9 +49,17 @@ Three existing mechanisms bound this:
 - **Recovery re-publish.** `RecoverInProgressSagas` runs at startup and every
   30s, lists sagas in `IN_PROGRESS` / `COMPENSATING`, and re-publishes the
   command for the current step. A publish lost to a crash is re-emitted.
-- **Consumer idempotency.** `inventory_logs (order_id, action)` and
-  `processed_events (message_id)` make a re-publish a no-op if the original
-  *did* land. So re-publishing blindly is always safe.
+- **Consumer idempotency (two layers).** Each consumer dedups in two layers, and
+  the recovery loop relies on the second one:
+  - *Fast path* — `processed_events (message_id)` (order, payment) /
+    `inventory_logs (order_id, action)` (inventory). Catches a true broker
+    **redelivery of the same message** and skips a redundant DB transaction.
+  - *Backstop* — an in-transaction state/business guard:
+    `current_step != <expected> → skip` in `saga_repository.go`, plus
+    `payments.order_id` UNIQUE (`GetByOrderID`) and `inventory_logs (order_id,
+    action)`. This is what catches a **recovery re-publish**: the recovery loop
+    publishes with a fresh `shared.NewUUID()`, so the message_id is new and the
+    fast path always misses — only the backstop makes the duplicate a safe no-op.
 
 Net: the gap costs at most ~30s of extra latency for an unlucky saga, never a
 lost order. Correctness holds; only worst-case recovery time is affected.
@@ -96,4 +104,4 @@ becomes a requirement.**
 | "DB commit then publish — lost message on crash?" | "Yes, that gap exists. I bound it with persisted saga state + a 30s recovery loop that re-publishes the current step, and idempotent consumers that make re-sends free. Worst case is ~30s extra latency, never a lost order." |
 | "Why not a transactional outbox?" | "It's the cleaner fix and I'd reach for it if we needed sub-30s recovery. Here the recovery loop already gives the correctness guarantee; the outbox would only cut recovery latency, at the cost of an outbox table + relay per service. Not justified by this workload." |
 | "Isn't the recovery loop just a worse outbox?" | "It trades immediacy for simplicity. The outbox records publish intent atomically; the recovery loop re-derives it from persisted saga state on a timer. Same at-least-once + idempotency contract; different latency/operational tradeoff." |
-| "What stops a re-publish from double-processing?" | "Consumer-side idempotency: `(order_id, action)` for inventory, `processed_events(message_id)` for payment/order. A duplicate is a no-op." |
+| "What stops a re-publish from double-processing?" | "Two layers. The `message_id` dedup (`processed_events`) is a *fast path* that skips a redundant DB tx on a true broker redelivery. But the recovery loop re-publishes with a *fresh* id, so the fast path always misses it — the correctness guarantee there is the *backstop*: the in-transaction state guard (`current_step != expected → skip`) plus `payments.order_id` UNIQUE and `inventory_logs(order_id, action)`. A recovery re-publish is safe because of the backstop, not the id dedup. Proven by `TestOnPaymentProcessed_RepublishWithNewEventID_AdvancesOnce` and `TestProcess_Idempotent`." |

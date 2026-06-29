@@ -53,9 +53,13 @@ func (m *mockPublisher) Publish(ctx context.Context, exchange, routingKey, messa
 
 // ─── Test ──────────────────────────────────────────────────────────────────
 
-// TestProcess_Idempotent verifies that a re-delivery for the same order_id with a
-// fresh msg_id does not create a second payment row; the handler reuses the existing
-// payment and re-publishes the same outcome.
+// TestProcess_Idempotent verifies the recovery re-publish path is a no-op via the
+// *backstop*, not the message-id fast path. A recovery re-publish carries a fresh
+// msg_id (here "msg-2"), so the processed_events(message_id) fast path never matches
+// it — the handler falls through to GetByOrderID and the payments.order_id UNIQUE /
+// existing-row check, which makes the second pass take the idempotent branch: no
+// second payment row, no second CreatePaymentWithEvent. This is the payment-side
+// proof that a re-publish with a new message_id does not double-charge.
 func TestProcess_Idempotent(t *testing.T) {
 	paymentRepo := &mockPaymentRepo{}
 	eventRepo := &mockEventRepo{}
