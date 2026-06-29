@@ -237,6 +237,51 @@ func TestE2E_RetryTopologyDeclared_HappyPathCompletes(t *testing.T) {
 	assert.Equal(t, "COMPLETED", getSagaStatusForOrder(t, infra, orderID), "saga_state should be COMPLETED")
 }
 
+// ─── TestE2E_InventoryLogUniqueOrderActionConstraint ────────────────────────
+
+// Asserts inventory_logs enforces (order_id, action) uniqueness at the DB level.
+// This is the idempotency *backstop* for inventory: the ExistsReserve/ExistsRelease
+// pre-check is racy across the consumer's worker pool, so under a concurrent
+// re-delivery of the same order (recovery re-publish, or multi-replica recovery)
+// two workers can both pass the pre-check and both run ReserveAtomic. The
+// optimistic version CAS serialises them but does NOT dedup — the loser re-reads
+// and reserves again, double-decrementing — unless the (order_id, action) insert
+// is rejected by a UNIQUE constraint. Sibling guards (payments.order_id,
+// saga_states.order_id, processed_events.event_id) are all unique; this proves
+// inventory_logs is too. AutoMigrate is the only schema source, so this verifies
+// the gorm tag actually produces a UNIQUE index on real MySQL.
+func TestE2E_InventoryLogUniqueOrderActionConstraint(t *testing.T) {
+	infra := setupInfra(t)
+	infra.resetSchemas(t)
+	infra.startAllServices(t, 0.0) // boots inventory-service → AutoMigrate
+
+	db := infra.schemaDB(t, "inventory_db")
+	defer db.Close()
+
+	// Wait until AutoMigrate has created inventory_logs.
+	require.Eventually(t, func() bool {
+		var n int
+		err := db.QueryRow("SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='inventory_db' AND table_name='inventory_logs'").Scan(&n)
+		return err == nil && n == 1
+	}, 30*time.Second, 200*time.Millisecond, "inventory_logs table never created")
+
+	// A UNIQUE index covering both order_id and action must exist.
+	var uniqueIdx int
+	require.NoError(t, db.QueryRow(`
+		SELECT COUNT(*) FROM (
+			SELECT index_name
+			FROM information_schema.statistics
+			WHERE table_schema = 'inventory_db'
+			  AND table_name = 'inventory_logs'
+			  AND non_unique = 0
+			  AND column_name IN ('order_id', 'action')
+			GROUP BY index_name
+			HAVING COUNT(DISTINCT column_name) = 2
+		) t`).Scan(&uniqueIdx))
+	assert.GreaterOrEqual(t, uniqueIdx, 1,
+		"inventory_logs must have a UNIQUE index on (order_id, action) so a concurrent re-delivery cannot double-reserve")
+}
+
 // ─── helpers used by the tests above ───────────────────────────────────────
 
 func seedInventory(t *testing.T, infra *testInfra, productID uint64, qty int) {
