@@ -181,6 +181,55 @@ func TestHandlePaymentFailedEvent_TriggersCompensation(t *testing.T) {
 	pub.AssertExpectations(t)
 }
 
+// TestOnPaymentProcessed_RepublishWithNewEventID_AdvancesOnce proves the recovery
+// re-publish path is a no-op via the *backstop*, not the message-id fast path.
+//
+// The recovery loop re-publishes ProcessPaymentCmd with a fresh UUID, so the
+// resulting PaymentProcessedEvent carries a NEW eventID that the
+// processed_events(message_id) fast path never matches. The in-transaction state
+// guard (`current_step != PROCESSING_PAYMENT → Skip`) in saga_repository.go is
+// what makes the duplicate safe. Here CommitPaymentProcessed is mocked, so the
+// mock returns Skip=true on the second eventID to simulate that guard firing;
+// the orchestrator behaviour under test is that it treats Skip as a full no-op —
+// no second terminal transition, no downstream publish.
+//
+// Sanity: if the guard were removed in saga_repository.go, the second event would
+// re-run the terminal transition instead of skipping; that is covered at the repo
+// layer, not here.
+func TestOnPaymentProcessed_RepublishWithNewEventID_AdvancesOnce(t *testing.T) {
+	sagaRepo := &mockSagaRepo{}
+	orderRepo := &mockOrderRepo{}
+	pub := &mockPublisher{}
+
+	event := shared.PaymentProcessedEvent{
+		SagaID:        "saga-rp",
+		OrderID:       77,
+		TransactionID: "tx-77",
+		Success:       true,
+	}
+
+	// First delivery (eventID "A"): saga is at PROCESSING_PAYMENT, guard passes,
+	// saga advances to DONE/COMPLETED. Success path records a terminal and does
+	// not publish anything downstream.
+	sagaRepo.On("CommitPaymentProcessed", mock.Anything, "A", event).
+		Return(repository.PaymentProcessedOutcome{Skip: false, Compensate: false, Duration: time.Second}, nil).Once()
+
+	// Second delivery (eventID "B", a recovery re-publish): the saga already left
+	// PROCESSING_PAYMENT, so the state guard fires → Skip. The fast path is missed
+	// because "B" is a brand-new id.
+	sagaRepo.On("CommitPaymentProcessed", mock.Anything, "B", event).
+		Return(repository.PaymentProcessedOutcome{Skip: true}, nil).Once()
+
+	o := NewSagaOrchestrator(sagaRepo, orderRepo, pub, nil)
+	assert.NoError(t, o.onPaymentProcessed(context.Background(), event, "A"))
+	assert.NoError(t, o.onPaymentProcessed(context.Background(), event, "B"))
+
+	// The saga advanced exactly once; the re-publish with a new id was a no-op.
+	sagaRepo.AssertNumberOfCalls(t, "CommitPaymentProcessed", 2)
+	pub.AssertNotCalled(t, "Publish")
+	sagaRepo.AssertExpectations(t)
+}
+
 // TestStartSaga covers the saga kickoff: persist state + publish first command.
 func TestStartSaga(t *testing.T) {
 	sagaRepo := &mockSagaRepo{}

@@ -85,6 +85,8 @@ START (IN_PROGRESS)┼── reserved ─► (PROCESSING_PAYMENT) ─┬── p
 - A consumer can be down when the command is published; it picks up the queued message on restart.
 - The recovery loop covers the case where the publish itself was lost (e.g., publish-after-commit failed in a previous run).
 
+**Known limitation — multi-replica recovery duplication.** With N `order-service` replicas, every replica runs its own 30s `RecoverInProgressSagas` tick, so an interrupted saga gets re-published N times per tick. Correctness still holds (consumers are idempotent), but the re-publishes are wasteful. Upgrade path: leader election or a DB advisory lock around the recovery tick so only one replica re-publishes. Not implemented — this is a single-writer workload.
+
 ## Admin Endpoints
 
 Read-only, served by `order-service`:
